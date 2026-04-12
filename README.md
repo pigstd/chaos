@@ -17,7 +17,7 @@ The purpose of this policy is to ensure you *understand* the bugs and the code y
 
 ## Overview
 
-This project is built on top of the [rCore](https://github.com/rcore-os/rCore) teaching operating system. The file `kernel/src/chaos_monolith.rs` contains a monolithic kernel simulation with **intentionally embedded bugs** across multiple subsystems -- locking, memory management, scheduling, file systems, IPC, signal handling, and more. Some bugs cause incorrect behavior at runtime; others prevent compilation entirely.
+This project is built on top of the [rCore](https://github.com/rcore-os/rCore) teaching operating system. The file `kernel/src/kernel.rs` contains a monolithic kernel simulation with **intentionally embedded bugs** across multiple subsystems -- locking, memory management, scheduling, file systems, IPC, signal handling, and more. Some bugs cause incorrect behavior at runtime; others prevent compilation entirely.
 
 A comprehensive test suite is provided under `chaos-tests/`.
 
@@ -25,7 +25,7 @@ A comprehensive test suite is provided under `chaos-tests/`.
 
 ### Task 1: Debug and Pass All Tests
 
-The kernel code in `kernel/src/chaos_monolith.rs` contains numerous bugs of varying difficulty.
+The kernel code in `kernel/src/kernel.rs` contains numerous bugs of varying difficulty.
 
 Your goal is to **find and fix all bugs** so that the entire test suite passes:
 
@@ -44,7 +44,7 @@ All three test groups must pass for full credit.
 
 ### Task 2: Rewrite the Code
 
-After debugging, **rewrite `kernel/src/chaos_monolith.rs`** to improve code quality:
+After debugging, **rewrite `kernel/src/kernel.rs`** to improve code quality:
 
 - Add clear, meaningful comments where appropriate
 - Rename cryptic variables and functions to descriptive names
@@ -60,7 +60,7 @@ The rewrite is graded on **readability, structure, and correctness**.
 chaos/
 ├── kernel/
 │   └── src/
-│       └── chaos_monolith.rs      # The buggy monolithic kernel (YOUR TARGET)
+│       └── kernel.rs      # The buggy monolithic kernel (YOUR TARGET)
 └── README.md                      # This file
 ```
 
