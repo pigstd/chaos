@@ -42,6 +42,11 @@ cargo test --test pressure
 
 All three test groups must pass for full credit.
 
+> **Clarifications (April 28)**
+>
+> `chaos-tests/src/lib.rs` is now a symbolic link pointing to `kernel/src/kernel.rs`.
+> Therefore, any changes made to the kernel source will automatically be reflected in the test suites.
+
 ### Task 2: Rewrite the Code
 
 After debugging, **rewrite `kernel/src/kernel.rs`** to improve code quality:
