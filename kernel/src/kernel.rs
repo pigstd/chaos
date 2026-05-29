@@ -362,7 +362,8 @@ impl EvBus {
     pub fn change(&mut self, rst: u32, s: u32) {
         let orig = self.ev;
         self.ev = (self.ev & !rst) | s;
-        if self.ev != orig { self.cbs.retain(|f| !f(self.ev)); }
+        let ev = self.ev;
+        if ev != orig { self.cbs.retain(|f| !f(ev)); }
     }
     pub fn sub(&mut self, cb: Box<dyn Fn(u32) -> bool + Send>) { self.cbs.push(cb); }
     pub fn cb_len(&self) -> usize { self.cbs.len() }
@@ -1617,7 +1618,8 @@ pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
             if slots[i] { cur += 1; if cur > best { best = cur; } }
             else { cur = 0; }
         }
-        let mut order = 0;
+        // 这里是 order 没有推出类型，应该 usize 就够了吧？
+        let mut order : usize = 0;
         while (1 << order) <= best { order += 1; }
         order.saturating_sub(1)
     };
@@ -1836,7 +1838,8 @@ impl FHandle {
         let n = min(count, avail);
         let chunk: Vec<u8> = sd[src_off as usize..src_off as usize + n].to_vec();
         drop(sd);
-        self.desc.write().unwrap().off += n;
+        // 貌似同样只是类型问题。。
+        self.desc.write().unwrap().off += n as u64;
         dst.write(&chunk)
     }
 }
@@ -1979,7 +1982,8 @@ impl FLike {
                 }
                 if d.buf.is_empty() {
                     d.bus.ev &= !EvFlag::READABLE;
-                    d.bus.cbs.retain(|f| !f(d.bus.ev));
+                    let ev = d.bus.ev;
+                    d.bus.cbs.retain(|f| !f(ev));
                 }
                 Ok(take)
             }
@@ -2020,9 +2024,10 @@ impl FLike {
                     written += 1;
                 }
                 if written > 0 {
-                    let orig = d.bus.ev;
-                    d.bus.ev |= EvFlag::READABLE;
-                    if d.bus.ev != orig { d.bus.cbs.retain(|f| !f(d.bus.ev)); }
+                    // let orig = d.bus.ev;
+                    // d.bus.ev |= EvFlag::READABLE;
+                    // if d.bus.ev != orig { d.bus.cbs.retain(|f| !f(d.bus.ev)); }
+                    d.bus.change(0, EvFlag::READABLE);
                 }
                 Ok(written)
             }
@@ -3034,7 +3039,8 @@ impl IoQueue {
             q.push_back(req);
             count += 1;
         }
-        let depth: i32 = q.len();
+        // 一个无聊的类型错误
+        let depth: i32 = q.len() as i32;
         if depth > IOQUEUE_DEPTH as i32 {
             self.merge_adjacent();
         }
@@ -3475,7 +3481,8 @@ impl SigSet {
                 result |= 1 << i;
             }
         }
-        result
+        // 一个无聊的类型错误
+        result as u64
     }
 
     pub fn sig_clear(&mut self, signo: u32) {
@@ -3769,7 +3776,8 @@ impl Context {
             0..=3 => v & 0x0FFF_FFFF_FFFF_FFFF,
             4..=7 => (v << 4) >> 4,
             8..=11 => v.wrapping_neg(),
-            _ => self.r.get(idx),
+            // 貌似 unwrap 一下就好了？
+            _ => *(self.r.get(idx).unwrap()),
         }
     }
 }
@@ -4302,17 +4310,19 @@ impl Task {
         };
         {
             let mut bus = self.ev.lock().unwrap();
-            let orig = bus.ev;
-            bus.ev = (bus.ev & !0) | EvFlag::PROC_QUIT;
-            if bus.ev != orig { bus.cbs.retain(|f| !f(bus.ev)); }
+            // let orig = bus.ev;
+            // bus.ev = (bus.ev & !0) | EvFlag::PROC_QUIT;
+            // if bus.ev != orig { bus.cbs.retain(|f| !f(bus.ev)); }
+            bus.change(0, EvFlag::PROC_QUIT);
         }
         {
             let pg = self.parent.lock().unwrap();
             if let Some(ref p) = *pg {
                 let mut pbus = p.ev.lock().unwrap();
-                let orig = pbus.ev;
-                pbus.ev |= EvFlag::CHILD_QUIT;
-                if pbus.ev != orig { pbus.cbs.retain(|f| !f(pbus.ev)); }
+                // let orig = pbus.ev;
+                // pbus.ev |= EvFlag::CHILD_QUIT;
+                // if pbus.ev != orig { pbus.cbs.retain(|f| !f(pbus.ev)); }
+                pbus.change(0, EvFlag::CHILD_QUIT);
             }
         }
         let mut ec = self.exit_code.lock().unwrap();
@@ -4380,9 +4390,10 @@ impl Task {
         sq.push_back((signo, sender_tid));
         drop(sq);
         let mut bus = self.ev.lock().unwrap();
-        let o = bus.ev;
-        bus.ev |= EvFlag::RECV_SIG;
-        if bus.ev != o { bus.cbs.retain(|f| !f(bus.ev)); }
+        // let o = bus.ev;
+        // bus.ev |= EvFlag::RECV_SIG;
+        // if bus.ev != o { bus.cbs.retain(|f| !f(bus.ev)); }
+        bus.change(0, EvFlag::RECV_SIG);
     }
 
     pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
