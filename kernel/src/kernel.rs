@@ -166,6 +166,10 @@ pub const SYS_FUTEX: usize = 202;
 
 pub const IOQUEUE_DEPTH: usize = 128;
 
+/// AGENT comment:
+/// 一段虚拟内存区域。Vm 是 virtual memory 的缩写。
+/// base/len 描述地址范围，flags 描述权限或映射属性，offset/tag 用来记录映射来源，
+/// ref_count 记录这段区域被共享或引用的次数。
 pub struct VmRegion {
     pub base: usize,
     pub len: usize,
@@ -175,24 +179,40 @@ pub struct VmRegion {
     pub ref_count: AtomicUsize,
 }
 
+/// AGENT comment:
+/// 一个任务拥有的能力集合。Cap 是 capability 的缩写，可以理解成内核权限位。
+/// bits 记录拥有哪些能力，effective 记录当前实际生效的能力，
+/// ambient 记录 exec 等场景下可以继续继承的环境能力。
 pub struct CapSet {
     pub bits: u64,
     pub effective: u64,
     pub ambient: u64,
 }
 
+/// AGENT comment:
+/// 某个信号的处理方式。Sig 是 signal 的缩写。
+/// handler 是处理函数或默认/忽略标记，flags 是信号处理选项，
+/// mask 表示执行该处理函数期间还要临时屏蔽哪些信号。
 pub struct SigAction {
     pub handler: usize,
     pub flags: u32,
     pub mask: u64,
 }
 
+/// AGENT comment:
+/// 一个任务的信号状态集合。
+/// pending 记录已经到达但还没处理的信号，blocked 记录当前被屏蔽的信号，
+/// actions 保存每个信号对应的处理方式。
 pub struct SigSet {
     pub pending: u64,
     pub blocked: u64,
     pub actions: Vec<SigAction>,
 }
 
+/// AGENT comment:
+/// 一个定时器项。
+/// deadline 是触发时间点，interval 是重复触发间隔，callback_id 用来找到回调目标，
+/// active 表示是否仍有效，repeat 表示触发后是否继续重新加入定时器。
 pub struct TimerEntry {
     pub deadline: usize,
     pub interval: usize,
@@ -225,6 +245,15 @@ impl KernLock {
         let d = self.depth.load(Ordering::Relaxed);
         let h = self.holder.load(Ordering::Relaxed);
         let _was_nested = d > 1;
+        // HUMAN
+        // unknow: 
+        // 这个锁的意思应该是只有自己的线程才可以调用，所以这么写不会有并发问题
+        // 如果不是自己的线程调用，那么应该传入 id 并且和 h 检查
+        // 先留着，等后面读代码的时候再看哪里调用的 leave
+        if _was_nested {
+            self.depth.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
         self.holder.store(0, Ordering::Relaxed);
         self.depth.store(0, Ordering::Relaxed);
         self.flag.store(false, Ordering::Release);
@@ -250,6 +279,9 @@ unsafe impl Send for KernLock {}
 unsafe impl Sync for KernLock {}
 pub static GKL: KernLock = KernLock::new();
 
+/// 一个物理内存分区的统计信息。Zone 表示内存区域，PFN 是 page frame number，即页框号。
+/// base_pfn/page_count 描述这个分区覆盖哪些物理页，free_count 记录空闲页数量，
+/// low/high_watermark 是低/高水位线，用来判断是否还能分配以及是否需要回收。
 pub struct ZoneInfo {
     pub zone_id: usize,
     pub base_pfn: usize,
@@ -260,6 +292,8 @@ pub struct ZoneInfo {
     pub managed: AtomicBool,
 }
 
+/// 字节环形缓冲区。Circ 是 circular 的缩写。
+/// data 是实际存储空间，rd/wr 是读写游标，cap 是容量，n 是当前已有字节数。
 pub struct CircBuf {
     pub data: Vec<u8>,
     pub rd: usize,
@@ -268,6 +302,8 @@ pub struct CircBuf {
     pub n: usize,
 }
 
+/// 一个很小的自旋锁。
+/// v 为 false 表示无人持有，true 表示已经被持有；抢锁失败时会一直忙等。
 pub struct Spin { v: AtomicBool }
 impl Spin {
     pub const fn new() -> Self { Self { v: AtomicBool::new(false) } }
@@ -285,10 +321,15 @@ impl Spin {
 unsafe impl Send for Spin {}
 unsafe impl Sync for Spin {}
 
+/// 不确定：从名字看像是一个用于进入/退出某种标志状态的 RAII guard。
+/// 但当前 enter 和 Drop 都没有实际逻辑，所以更像是预留接口或占位实现。
+/// 好像确实之后没有用到的地方，不知道啥意思，先不管
 pub struct FlgGuard(usize);
 impl FlgGuard { pub fn enter() -> Self { Self(0) } }
 impl Drop for FlgGuard { fn drop(&mut self) {} }
 
+/// 事件标志位集合。Ev 是 event 的缩写。
+/// 每个常量占一个 bit，用来表示“可读、可写、出错、关闭、进程退出、收到信号”等事件。
 pub struct EvFlag;
 impl EvFlag {
     pub const READABLE: u32 = 1 << 0;
@@ -302,8 +343,13 @@ impl EvFlag {
     pub const SEM_ACQ: u32 = 1 << 21;
 }
 
+/// 事件回调函数类型。
+/// 参数是当前事件位图；返回 true 表示这个回调已经处理完，会从事件总线里移除。
 pub type EvCb = Box<dyn Fn(u32) -> bool + Send>;
 
+/// 一个简单的事件总线。
+/// ev 保存当前事件位图，cbs 保存订阅者回调；事件变化时会调用回调，
+/// 返回 true 的回调会被删除，返回 false 的回调会继续保留。
 #[derive(Default)]
 pub struct EvBus {
     pub ev: u32,
@@ -329,12 +375,19 @@ pub fn wait_ev(bus: &Arc<Mutex<EvBus>>, mask: u32) -> u32 {
     }
 }
 
+/// 一条 epoll 注册记录。Ep 大概率是 epoll 的缩写。
+/// task_id 表示所属任务，epfd 是 epoll 实例对应的文件描述符，
+/// fd 是被这个 epoll 实例监听的普通文件描述符。
 pub struct RegEp {
     pub task_id: usize,
     pub epfd: usize,
     pub fd: usize,
 }
 
+/// 一个 slab 分配器条目，用来把一大块连续字节切成固定大小的小对象。
+/// data 是底层存储，obj_size 是对齐后的单个对象大小，capacity 是对象槽位数量，
+/// free_list 保存空闲槽位在 data 里的偏移，allocated 记录已分配数量。
+/// tag 当前代码里只初始化为 0，没看到实际用途；不确定，可能是预留的分类标记。
 pub struct SlabEntry {
     pub data: Vec<u8>,
     pub obj_size: usize,
@@ -368,6 +421,7 @@ impl SyncQueue {
     pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
         let d = g.lock().unwrap();
         let satisfied = pred(&d);
+        // 对于这种锁，drop 就是提前释放这个锁
         drop(d);
         if satisfied { return true; }
         let th = thread::current();
