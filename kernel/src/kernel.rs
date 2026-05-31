@@ -4656,6 +4656,7 @@ pub struct Kernel {
     pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,
     pub shm_store: RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
     pub tty_buf: Mutex<VecDeque<u8>>,
+    pub disk : Disk,
 }
 impl Kernel {
     pub fn new(nf: usize) -> Self {
@@ -4668,6 +4669,9 @@ impl Kernel {
             sem_store: RwLock::new(BTreeMap::new()),
             shm_store: RwLock::new(BTreeMap::new()),
             tty_buf: Mutex::new(VecDeque::new()),
+            // human：请问这是人类吗？
+            // 神了，我不知道 disk 的这个 lable 有啥用，好像根本没用，先放一个空的
+            disk: Disk::new(""),
         }
     }
     pub fn tick(&self, id: usize) {
