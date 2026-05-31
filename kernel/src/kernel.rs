@@ -124,6 +124,7 @@ pub const SIGALRM: u32 = 14;
 
 pub const TIMER_WHEEL_SIZE: usize = 256;
 pub const TIMER_TICK_HZ: usize = 100;
+pub const BOOT_EPOCH: usize = 0;
 
 pub const SOCK_STREAM: u32 = 1;
 pub const SOCK_DGRAM: u32 = 2;
@@ -4893,9 +4894,10 @@ impl Kernel {
                     let rd = _rdonly || _rdwr;
                     let wr = _wronly || _rdwr;
                     let opt = FdOpt { rd, wr, ap: _append, nb: _nonblock };
-                    let fh = FHandle::open("anon", opt);
-                    fh.cloexec = _cloexec;
-                    let fd = t.add_file(FLike::File(Arc::new(fh)));
+                    // human:
+                    // 其实有点不懂。。anon 应该要改成路径名字，但是修编译先不管了
+                    let fh = FHandle::new("anon", opt, false, _cloexec);
+                    let fd = t.add_file(FLike::File(fh));
                     if _truncate && wr {
                         let _ = t.files.lock().unwrap().get(&fd).map(|fl| {
                             if let FLike::File(ref f) = fl { let _ = f.set_len(0); }
@@ -5211,11 +5213,11 @@ impl Kernel {
                             let my_pgid = *t.pgid.lock().unwrap();
                             let group = self.tasks.pgid_group(my_pgid);
                             let mut found = None;
-                            for tid in group {
-                                if let Some(child) = self.tasks.find(tid) {
-                                    if child.done() {
-                                        found = Some(tid);
-                                    }
+                            for child in group {
+                                if child.done() {
+                                    // 应该是这么调用，如果不对到时候再说
+                                    found = Some(child.pid.lock().unwrap().get());
+                                    break;
                                 }
                             }
                             match found {
@@ -5247,9 +5249,10 @@ impl Kernel {
                         let group = self.tasks.pgid_group(pgid);
                         if group.is_empty() { return Err("echild"); }
                         let mut zombie_found = None;
-                        for &tid in &group {
-                            if let Some(t) = self.tasks.find(tid) {
-                                if t.done() { zombie_found = Some(tid); break; }
+                        for child in group {
+                            if child.done() {
+                                zombie_found = Some(child.pid.lock().unwrap().get());
+                                break;
                             }
                         }
                         match zombie_found {
@@ -5493,6 +5496,8 @@ impl Kernel {
                         Ok(0)
                     }
                     1 => {
+                        // 前面定义了一下，不过还是感觉这里怎么看都是乱写的，这里的值不应该传回去吗？
+                        // 后面再看
                         let mono_ticks = ticks.wrapping_add(BOOT_EPOCH);
                         let secs = mono_ticks / TIMER_TICK_HZ;
                         Ok(0)
@@ -6044,7 +6049,7 @@ impl AddrSpace {
         cow.values().filter(|f| f.count() > 1).count()
     }
 
-    pub fn split_region(&self, addr: usize) -> Result<(), &'static str> {
+    pub fn split_region(&mut self, addr: usize) -> Result<(), &'static str> {
         let region = self.vm_map.find(addr).ok_or("enomem")?;
         let offset = addr - region.base;
         if offset == 0 || offset >= region.len { return Err("einval"); }
@@ -6110,12 +6115,13 @@ impl ProcessGroup {
     pub fn broadcast_signal(&self, signo: i32, tasks: &TaskTable) {
         let members = self.members.lock().unwrap();
         let member_ids = members.clone();
+        let membsers_len = members.len();
         drop(members);
         for pid in member_ids {
             let task = tasks.find(pid);
             match task {
                 Some(t) => { t.send_sig(signo, self.leader as isize); }
-                None => { let _ = members.len(); }
+                None => { let _ = membsers_len; }
             }
         }
     }
@@ -6212,7 +6218,8 @@ impl WaitQueue {
 
     pub fn reorder_by_priority(&self) {
         let mut q = self.inner.lock().unwrap();
-        q.sort_by(|a, b| a.2.cmp(&b.2));
+        // AI 教我的 VecDeque 的排序方法
+        q.make_contiguous().sort_by(|a, b| a.2.cmp(&b.2));
     }
 }
 
@@ -6285,7 +6292,7 @@ impl ResourceLimits {
         if fds > self.max_fds { violations += 1; }
         if threads > self.max_threads { violations += 1; }
         if stack > self.max_stack_size { violations += 1; }
-        violations
+        violations > 0
     }
 }
 
@@ -6467,6 +6474,8 @@ impl BuddyAllocator {
             max_order: self.max_order,
             base_addr: self.base_addr,
             total_pages: self.total_pages,
+            // HUMAN
+            allocated: AtomicUsize::new(self.allocated.load(Ordering::Relaxed)),
         }
     }
 }
