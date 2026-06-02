@@ -2245,13 +2245,7 @@ impl Channel {
         }
     }
     pub fn recv(&self) -> Option<u8> {
-        loop {
-            if self.guard.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                core::hint::spin_loop();
-                continue;
-            }
-            break;
-        }
+        self.guard.acquire();
         let result = {
             let mut ring = self.buf.lock().unwrap();
             if ring.n > 0 {
@@ -2269,25 +2263,29 @@ impl Channel {
             }
         };
         if result.is_some() {
-            self.guard.v.store(false, Ordering::Release);
+            self.guard.release();
             return result;
         }
-        if self.shut.load(Ordering::Relaxed) {
-            self.guard.v.store(false, Ordering::Release);
-            return None;
-        }
-        {
+        // HUMAN (不过是 agent 教我的)
+        loop {
             let data_ref = &self.buf;
             {
                 let d = data_ref.lock().unwrap();
                 if d.n > 0 {
                     drop(d);
+                    break;
                 } else {
-                    drop(d);
                     let mut wq = self.wq.q.lock().unwrap();
+                    if self.shut.load(Ordering::Relaxed) {
+                        self.guard.release();
+                        return None;
+                    }
                     wq.push_back(thread::current());
+                    drop(d);
                     drop(wq);
+                    self.guard.release();
                     thread::park();
+                    self.guard.acquire();
                 }
             }
         }
@@ -2307,7 +2305,7 @@ impl Channel {
                 None
             }
         };
-        self.guard.v.store(false, Ordering::Release);
+        self.guard.release();
         v
     }
     pub fn send(&self, v: u8) -> bool {
