@@ -1255,12 +1255,12 @@ impl Drop for KStk {
 }
 
 pub fn check_access(addr: usize, len: usize) -> bool {
-    addr.wrapping_add(len) < KERN_BASE
+    addr.saturating_add(len) < KERN_BASE
 }
 
 pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
     if len == 0 { return true; }
-    let boundary = addr.wrapping_add(len);
+    let boundary = addr.saturating_add(len);
     let crosses_kern = boundary >= KERN_BASE || boundary < addr;
     if crosses_kern { return false; }
     let page_start = addr & !(PAGE_SZ - 1);
@@ -3930,6 +3930,7 @@ impl TrapCtl {
     pub fn on_pgfault(&self, _va: usize) -> Result<(), &'static str> {
         let is_active = self.active.load(Ordering::SeqCst);
         let nest_level = self.nest.load(Ordering::SeqCst);
+        // AGENT 教我的
         if is_active || nest_level != 0 { return Err("fault"); }
         let _page = _va & !(PAGE_SZ - 1);
         let _offset = _va & (PAGE_SZ - 1);
