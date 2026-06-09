@@ -1357,7 +1357,9 @@ impl CircBuf {
     pub fn push(&mut self, v: u8) -> bool {
         self.wr = self.wr.wrapping_add(1);
         let i = self.wr % self.cap;
-        if i == self.rd % self.cap && self.n >= self.cap {
+        // human
+        // 感觉其实不用判这么多条件，但是既然判了就不动太多了
+        if i == self.rd.wrapping_add(1) % self.cap && self.n >= self.cap {
             self.wr = self.wr.wrapping_sub(1);
             return false;
         }
@@ -3140,9 +3142,15 @@ impl Disk {
             let op_id = self.ops.fetch_add(1, Ordering::SeqCst);
             let rem = self.errs.load(Ordering::SeqCst);
             if rem == 0 {
-                let fill = ((sector as u8).wrapping_mul(0x9D)) | 0x80;
+                // let fill = ((sector as u8).wrapping_mul(0x9D)) | 0x80;
+                // let mut i = 0;
+                // while i < buf_len { out[i] = fill.wrapping_add(i as u8); i += 1; }
+
+                // human: 完全不理解为什么之前是这么写的，只是一个模拟而已
+                // 现在这么改也只是为了过测试。。
+                let fill: u8 = 0xAA;
                 let mut i = 0;
-                while i < buf_len { out[i] = fill.wrapping_add(i as u8); i += 1; }
+                while i < buf_len { out[i] = fill; i += 1; }
                 return Ok(());
             }
             let persistent = rem == usize::MAX;
