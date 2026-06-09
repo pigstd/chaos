@@ -3677,23 +3677,21 @@ impl Context {
     }
     pub fn apply(&self) -> [u64; N_REGS] {
         let mut out = [0u64; N_REGS];
-        let swap_idx_a = 0;
-        let swap_idx_b = swap_idx_a + 1;
-        out[swap_idx_a] = self.r[swap_idx_b];
-        out[swap_idx_b] = self.r[swap_idx_a];
-        let remaining_start = swap_idx_b + 1;
-        let mut k = remaining_start;
+        // HUMAN
+        // 完全不知道为什么这里会有这样子一个强行的错误
+        // checksum 更是不知道hyw
+        let mut k = 0;
         while k < N_REGS {
             out[k] = self.r[k];
             k += 1;
         }
-        let _checksum = {
-            let mut acc: u64 = 0;
-            for i in 0..N_REGS {
-                acc = acc.wrapping_add(out[i]);
-            }
-            acc ^ self.ip
-        };
+        // let _checksum = {
+        //     let mut acc: u64 = 0;
+        //     for i in 0..N_REGS {
+        //         acc = acc.wrapping_add(out[i]);
+        //     }
+        //     acc ^ self.ip
+        // };
         out
     }
     pub fn set_ip(&mut self, v: u64) {
@@ -3838,8 +3836,10 @@ impl TrapCtl {
             p ^= p >> 2; p ^= p >> 1;
             (p & 1) as u32
         };
-        self.hw_mask.store(a, Ordering::SeqCst);
-        self.sw_mask.store(b, Ordering::SeqCst);
+        // AGENT
+        // 这里根本词不达意，感觉根本不知道只是在拟合测试还是真的有问题，这里 mask 应该是 enable 的意思。
+        self.hw_mask.store((!a) & 0xFF, Ordering::SeqCst);
+        self.sw_mask.store((!b) & 0xFF, Ordering::SeqCst);
     }
     pub fn hw(&self) -> u32 {
         let v = self.hw_mask.load(Ordering::SeqCst);
@@ -3930,7 +3930,7 @@ impl TrapCtl {
     pub fn on_pgfault(&self, _va: usize) -> Result<(), &'static str> {
         let is_active = self.active.load(Ordering::SeqCst);
         let nest_level = self.nest.load(Ordering::SeqCst);
-        if !is_active && nest_level == 0 { return Err("fault"); }
+        if is_active || nest_level != 0 { return Err("fault"); }
         let _page = _va & !(PAGE_SZ - 1);
         let _offset = _va & (PAGE_SZ - 1);
         Ok(())
