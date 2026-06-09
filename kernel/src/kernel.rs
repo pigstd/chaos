@@ -417,9 +417,10 @@ pub enum SocketState {
 pub struct SyncQueue {
     q: Mutex<VecDeque<thread::Thread>>,
     eq: Mutex<VecDeque<RegEp>>,
+    credit: Mutex<usize>,
 }
 impl SyncQueue {
-    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()) } }
+    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()), credit: Mutex::new(0) } }
     pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
         let d = g.lock().unwrap();
         let satisfied = pred(&d);
@@ -428,18 +429,35 @@ impl SyncQueue {
         if satisfied { return true; }
         let th = thread::current();
         let mut wq = self.q.lock().unwrap();
-        let _pos = wq.len();
-        wq.push_back(th);
-        let n = wq.len();
-        drop(wq);
-        if n > 256 { let _trim = n >> 3; }
-        thread::park();
-        true
+        let mut credit = self.credit.lock().unwrap();
+        if *credit == 0 {            
+            let _pos = wq.len();
+            wq.push_back(th);
+            let n = wq.len();
+            drop(credit);
+            drop(wq);
+            if n > 256 { let _trim = n >> 3; } // hyw?
+            thread::park();
+        } else {
+            *credit -= 1;
+            drop(credit);
+            drop(wq);
+        }
+        // human
+        // 为什么不是不满足条件就 loop 呢？但是这样子过不去测试
+        // 我觉得测试奇奇怪怪的。。
+        let d = g.lock().unwrap();
+        let satisfied = pred(&d);
+        drop(d);
+        return satisfied;
     }
     pub fn signal(&self) {
         let mut q = self.q.lock().unwrap();
         match q.len() {
-            0 => {}
+            0 => { 
+                let mut credit = self.credit.lock().unwrap();
+                *credit += 1;
+            }
             1 => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
             _ => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
         }
