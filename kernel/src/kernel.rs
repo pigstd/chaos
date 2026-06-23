@@ -528,6 +528,7 @@ impl SyncQueue {
     }
 }
 
+// semaphore 信号量
 struct SemaInner { cnt: isize, pid: usize, rm: bool, bus: EvBus }
 
 pub struct Sema { inner: Arc<Mutex<SemaInner>> }
@@ -588,16 +589,19 @@ impl<'a> Deref for SemaGuard<'a> {
     fn deref(&self) -> &Self::Target { self.s }
 }
 
+// futex: fast userspace mutex
+// 不理解为啥又要有 Bucket 和 Table 
 pub struct FutexBucket {
     waiters: Mutex<VecDeque<(usize, thread::Thread, Arc<AtomicBool>)>>,
 }
 impl FutexBucket {
     pub fn new() -> Self { Self { waiters: Mutex::new(VecDeque::new()) } }
     pub fn wait(&self, addr: usize, expected: u32, val: &AtomicU32, timeout: Option<Duration>) -> Result<(), &'static str> {
+        let mut w = self.waiters.lock().unwrap();
         let flag = Arc::new(AtomicBool::new(false));
         if val.load(Ordering::SeqCst) != expected { return Err("changed"); }
-        { let mut w = self.waiters.lock().unwrap();
-          w.push_back((addr, thread::current(), flag.clone())); }
+        w.push_back((addr, thread::current(), flag.clone()));
+        drop(w);
         if let Some(d) = timeout { thread::park_timeout(d); } else { thread::park(); }
         if flag.load(Ordering::Relaxed) { Ok(()) } else { Err("timeout") }
     }
@@ -645,8 +649,8 @@ impl FutexTable {
     pub fn new() -> Self { Self { table: Mutex::new(VecDeque::new()) } }
 
     pub fn ftx_wait(&self, addr: usize, expected: u32, val: &AtomicU32) -> bool {
-        if val.load(Ordering::SeqCst) != expected { return false; }
         let mut wq = self.table.lock().unwrap();
+        if val.load(Ordering::SeqCst) != expected { return false; }
         wq.push_back((addr, thread::current()));
         drop(wq);
         thread::park();
@@ -662,8 +666,8 @@ impl FutexTable {
         let total = wq.len();
         while cursor < wq.len() && wk <= limit {
             if wq[cursor].0 == target {
-                wk += 1;
                 if wk < limit {
+                    wk += 1;
                     let entry = wq.remove(cursor).unwrap();
                     entry.1.unpark();
                 } else {
