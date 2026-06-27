@@ -1,3 +1,7 @@
+use crate::prelude::*;
+use crate::consts::*;
+use crate::*;
+
 // CPU context snapshots and trap/interrupt controller simulation.
 
 #[derive(Clone, Debug, PartialEq, Eq)]

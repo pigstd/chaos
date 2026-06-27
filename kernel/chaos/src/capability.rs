@@ -1,3 +1,7 @@
+use crate::prelude::*;
+use crate::consts::*;
+use crate::*;
+
 // Capability bitsets and inheritance helpers for simulated tasks.
 
 /// AGENT comment:

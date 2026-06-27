@@ -1,3 +1,7 @@
+use crate::prelude::*;
+use crate::consts::*;
+use crate::*;
+
 // ELF validation helper used by simulated exec paths.
 
 pub fn validate_elf_header(data: &[u8]) -> Result<usize, &'static str> {

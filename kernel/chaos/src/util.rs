@@ -1,3 +1,7 @@
+use crate::prelude::*;
+use crate::consts::*;
+use crate::*;
+
 // Generic algorithms and bit/address utility helpers.
 
 pub fn mem_scan_pattern(data: &[u8], pattern: &[u8], max_matches: usize) -> Vec<usize> {
