@@ -5,6 +5,7 @@ edition = "2021" # compatible with 2021 and 2024
 description = "Test suite for the Chaos Monolith Kernel debugging exercise"
 
 [dependencies]
+chaos-kernel = { path = "../kernel/chaos" }
 
 [dev-dependencies]
 

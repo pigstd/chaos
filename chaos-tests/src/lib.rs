@@ -1,1 +1,1 @@
-../../kernel/src/kernel.rs
+pub use chaos_kernel::*;

@@ -1,0 +1,7 @@
+[package]
+name = "chaos-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "User-space Chaos kernel simulation split out from the legacy monolithic kernel.rs"
+
+[dependencies]
