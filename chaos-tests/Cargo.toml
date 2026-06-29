@@ -14,6 +14,10 @@ name = "basic"
 path = "tests/basic/main.rs"
 
 [[test]]
+name = "fs-refactor"
+path = "tests/fs_refactor/main.rs"
+
+[[test]]
 name = "advanced"
 path = "tests/advanced/main.rs"
 

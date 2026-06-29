@@ -1,7 +1,7 @@
 use chaos_tests::*;
 
 #[test]
-fn basic_disk_starts_zeroed() {
+fn disk_starts_zeroed() {
     let d = Disk::new("d0", 4, 512);
     let mut buf = [0xFFu8; 512];
 
@@ -12,7 +12,7 @@ fn basic_disk_starts_zeroed() {
 }
 
 #[test]
-fn basic_disk_write_then_read_same_block() {
+fn disk_write_then_read_same_block() {
     let d = Disk::new("d0", 8, 512);
     let mut input = [0u8; 512];
     for (idx, b) in input.iter_mut().enumerate() {
@@ -26,7 +26,7 @@ fn basic_disk_write_then_read_same_block() {
 }
 
 #[test]
-fn basic_disk_blocks_are_isolated() {
+fn disk_blocks_are_isolated() {
     let d = Disk::new("d0", 8, 512);
     let block_three = [0x33u8; 512];
     let mut block_two = [0xFFu8; 512];
@@ -40,7 +40,7 @@ fn basic_disk_blocks_are_isolated() {
 }
 
 #[test]
-fn basic_disk_rejects_wrong_buffer_size() {
+fn disk_rejects_wrong_buffer_size() {
     let d = Disk::new("d0", 8, 512);
     let mut short_read = [0u8; 511];
     let short_write = [0u8; 511];
@@ -50,7 +50,7 @@ fn basic_disk_rejects_wrong_buffer_size() {
 }
 
 #[test]
-fn basic_disk_rejects_out_of_range_block() {
+fn disk_rejects_out_of_range_block() {
     let d = Disk::new("d0", 2, 512);
     let mut buf = [0u8; 512];
 
@@ -59,7 +59,7 @@ fn basic_disk_rejects_out_of_range_block() {
 }
 
 #[test]
-fn basic_disk_counts_operations() {
+fn disk_counts_operations() {
     let d = Disk::new("d0", 2, 512);
     let mut buf = [0u8; 512];
 

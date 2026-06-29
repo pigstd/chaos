@@ -169,7 +169,7 @@ pub struct Disk {
 - `flush()` 第一版只记录一次操作并返回 `Ok(())`。
 - `ops` 用于测试和观测读写次数。
 
-旧的 `read_block()` 填充 `0xAA`、`write_block()` 不保存数据、`Disk::failing()` 错误注入逻辑都可以删除或改测试。新的正确语义是：写入某个 block 后，再读同一个 block 必须读回同样的数据。
+旧的磁盘 mock 行为不再保留。新的正确语义是：写入某个 block 后，再读同一个 block 必须读回同样的数据。
 
 ### `fs/fd.rs`
 
@@ -421,11 +421,16 @@ write 超过当前 block_count:
 
 ## 测试计划
 
-新增测试建议放到：
+新增文件系统重构测试统一放到 `fs-refactor` integration test：
 
 ```text
-chaos-tests/tests/basic/group_swapfs.rs
+chaos-tests/tests/fs_refactor/main.rs
+chaos-tests/tests/fs_refactor/disk.rs
+chaos-tests/tests/fs_refactor/swapfs.rs
+chaos-tests/tests/fs_refactor/fd.rs
 ```
+
+当前第一批测试只放 Disk 块设备语义；后续 SwapFS、FHandle/fd、syscall 接入测试继续在同一个 `fs-refactor` 目标下新增模块。
 
 最小测试：
 
