@@ -125,38 +125,6 @@ impl SwapFs {
         sb.encode_into(&mut block)?;
         self.disk.write_block(0, &block)
     }
-
-    pub fn read_meta(&self, meta_index: usize) -> Result<SwapFsMetaDisk, &'static str> {
-        let (block_id, offset) = self.meta_location(meta_index)?;
-        let mut block = [0u8; SWAPFS_BLOCK_SIZE];
-        self.disk.read_block(block_id, &mut block)?;
-        SwapFsMetaDisk::decode_from(&block[offset..offset + SWAPFS_META_DISK_SIZE])
-    }
-
-    pub fn write_meta(&self, meta_index: usize, meta: &SwapFsMetaDisk) -> Result<(), &'static str> {
-        let (block_id, offset) = self.meta_location(meta_index)?;
-        let mut block = [0u8; SWAPFS_BLOCK_SIZE];
-        self.disk.read_block(block_id, &mut block)?;
-        meta.encode_into(&mut block[offset..offset + SWAPFS_META_DISK_SIZE])?;
-        self.disk.write_block(block_id, &block)
-    }
-
-    fn meta_location(&self, meta_index: usize) -> Result<(usize, usize), &'static str> {
-        let sb = self.sb.read().unwrap();
-        if meta_index >= sb.max_files as usize {
-            return Err("einval");
-        }
-        let block_offset = meta_index / SWAPFS_META_PER_BLOCK;
-        let slot = meta_index % SWAPFS_META_PER_BLOCK;
-        let block_id = sb
-            .meta_start_block
-            .checked_add(block_offset as u64)
-            .ok_or("einval")?;
-        if block_id >= sb.data_start_block {
-            return Err("einval");
-        }
-        Ok((block_id as usize, slot * SWAPFS_META_DISK_SIZE))
-    }
 }
 
 fn validate_format_args(

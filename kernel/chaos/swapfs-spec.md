@@ -130,7 +130,8 @@ kernel/chaos/src/fs/swapfs/
 fs/swapfs/mod.rs
 fs/swapfs/layout.rs
 fs/swapfs/fs.rs
-fs/swapfs/file.rs
+fs/swapfs/metadata.rs
+fs/swapfs/data.rs
 ```
 
 职责：
@@ -138,9 +139,10 @@ fs/swapfs/file.rs
 | 模块 | 职责 |
 | --- | --- |
 | `layout.rs` | 定义磁盘格式常量、superblock、metadata record，以及 encode/decode 辅助函数。 |
-| `fs.rs` | 定义 `SwapFs`，负责 format/mount、metadata table 加载、文件查找、创建、扩容、删除标记。 |
-| `file.rs` | 定义 `SwapFile` 或 `SwapOpenFile`，负责按 metadata index 执行 read/write/seek/set_len。 |
-| `mod.rs` | 对外 re-export `SwapFs`、`SwapFile`、layout 常量和错误类型。 |
+| `fs.rs` | 定义 `SwapFs` 和 `SwapFsAlloc`，负责 format/mount、superblock 同步、顺序 data block 分配。 |
+| `metadata.rs` | 负责按 metadata index 定位/读写 record，以及文件名查找、metadata slot 分配、create/open。 |
+| `data.rs` | 负责按 metadata index 执行 read_at/write_at/set_len，以及跨 block 读写、扩容搬家、补零。 |
+| `mod.rs` | 声明 SwapFS 子模块，并对外 re-export `SwapFs` 和 layout 常量。 |
 
 `fs/mod.rs` 需要新增：
 
@@ -638,6 +640,32 @@ unlink:
 
 这意味着 v1 中 metadata slot 可以复用，但 data blocks 暂时不会复用。后续加入 bitmap 后，再同时管理 metadata bitmap 和 data block bitmap。
 
+## 文件内容读写
+
+当前 `read_at/write_at/set_len` 直接根据 metadata 里的 `start_block + block_count + size` 访问 data blocks：
+
+```text
+read_at(index, off, buf):
+  1. read_meta(index)。
+  2. 检查 metadata.used、size <= block_count * block_size、data block 范围合法。
+  3. 如果 off >= size，返回 0。
+  4. 最多读取 min(buf.len, size - off) 字节。
+  5. 读操作可以跨 block，但不会读出 metadata.size 之外的数据。
+
+write_at(index, off, buf):
+  1. read_meta(index)。
+  2. 计算 end = off + buf.len，检查 offset 溢出。
+  3. 如果 end 超过当前容量，则先按 capacity 策略扩容搬家。
+  4. 如果 off > old_size，中间空洞写 0。
+  5. 把 buf 写入对应 data blocks。
+  6. 如果 end > old_size，更新 metadata.size。
+
+set_len(index, len):
+  1. 如果 len 超过当前容量，则先按 capacity 策略扩容搬家。
+  2. 如果 len > old_size，新增可见区间写 0。
+  3. 如果 len < old_size，只缩小 metadata.size，不回收 data blocks。
+```
+
 真实文件系统通常会维护 free-space metadata，例如：
 
 ```text
@@ -666,18 +694,18 @@ block data...  file data
 
 扩容：
 
-第一版推荐先实现简单搬家：
+当前实现采用简单搬家：
 
 ```text
 write 超过当前 block_count:
-  1. 计算需要的新 block_count。
-  2. 从 next_free_block 分配一段新的连续空间。
-  3. 把旧文件内容复制到新位置。
-  4. 更新 metadata.start_block/block_count/size。
-  5. 旧空间不回收。
+  1. 计算 required_blocks = ceil(desired_size / block_size)。
+  2. 计算 grown_blocks = max(required_blocks, max(1, old_block_count * 2))。
+  3. 优先从 next_free_block 分配 grown_blocks，类似 Vec 扩容，减少频繁搬家。
+  4. 如果 grown_blocks 因空间不足失败，并且 grown_blocks > required_blocks，则 fallback 到 required_blocks。
+  5. 把旧文件内容复制到新位置。
+  6. 更新 metadata.start_block/block_count/size。
+  7. 旧空间不回收。
 ```
-
-如果暂时不想实现搬家，也可以 v1a 直接返回 `enospc`，但文档和测试要明确。
 
 ## 路径规则
 
@@ -719,7 +747,7 @@ chaos-tests/tests/fs_refactor/swapfs.rs
 chaos-tests/tests/fs_refactor/fd.rs
 ```
 
-当前第一批测试只放 Disk 块设备语义；后续 SwapFS、FHandle/fd、syscall 接入测试继续在同一个 `fs-refactor` 目标下新增模块。
+测试统一放在 `chaos-tests/tests/fs_refactor/` 下。当前已经覆盖 Disk、Tty、SwapFS layout、format/mount、metadata record 读写，以及 SwapFS metadata create/open；后续 FHandle/fd、syscall 接入测试继续在同一个 `fs-refactor` 目标下新增模块。
 
 最小测试：
 
@@ -734,11 +762,17 @@ chaos-tests/tests/fs_refactor/fd.rs
    - 创建 `/a`。
    - 再 open `/a` 能拿到同一个 metadata index。
    - 重复 create with exclusive 返回 `eexist`。
+   - `open_or_create` 打开已有文件时不重新分配 data blocks。
+   - metadata slot 可以复用，但 data blocks 不回收，`next_free_block` 继续向前。
+   - 重新 mount 后仍能通过 metadata 找到已创建的文件。
 
 3. read/write：
    - 写入 `hello`。
-   - seek/read 能读回 `hello`。
+   - read_at 能读回 `hello`。
    - read 不能超过 `size`。
+   - 跨 block 写入后能完整读回。
+   - 稀疏写入时，中间空洞读出来是 0。
+   - set_len 扩大文件时新增区域是 0，缩小时只改变可见 size。
 
 4. fd offset：
    - 同一个 fd 连续读会推进 offset。
@@ -751,8 +785,8 @@ chaos-tests/tests/fs_refactor/fd.rs
 
 6. expand：
    - 写入超过初始 block capacity。
-   - 如果实现搬家，确认内容完整且 metadata 更新。
-   - 如果 v1a 不支持扩容，确认返回 `enospc`。
+   - 搬家后确认内容完整且 metadata 更新。
+   - 空间不足时返回 `enospc`，metadata size 和 `next_free_block` 不应被错误推进。
 
 7. unlink：
    - unlink 后 open 返回 `enoent`。
@@ -793,12 +827,13 @@ chaos-tests/tests/fs_refactor/fd.rs
 2. 增加 `fs/tty.rs` 和 `FLike::Tty`，把 `new_user_task()` 的 fd0/fd1/fd2 从 `FHandle("/dev/tty")` 迁移到 `TtyHandle`。
 3. 增加 `fs/swapfs/layout.rs`，实现 superblock/meta record 的 encode/decode。
 4. 增加 `SwapFs::format/mount/mount_or_format`，能读写 superblock 和 metadata table。
-5. 实现 `SwapFs::create/open/read_at/write_at/metadata_len`。
-6. 改 `FHandle`，删除 `data: Arc<Mutex<Vec<u8>>>`，改成 `fs: Arc<SwapFs>` 和 `meta_index: usize`。
-7. 让 `FHandle::read_at/write_at/metadata_sz/set_len/fallocate` 直接调用 SwapFS。
-8. 改 `FLike::File`，让它只调用 `FHandle` 方法，不直接访问 `FHandle` 内部字段。
-9. 增加 `Kernel` 内部 fd API：`open_file_for_task/read_fd/write_fd`。
-10. 最后再改 `dispatch_syscall` 的 `SYS_OPEN/SYS_READ/SYS_WRITE`。
+5. 实现 `SwapFs::create/open/open_or_create/metadata_len`，先跑通“文件名 -> metadata index -> data block 分配”。
+6. 实现 `SwapFs::read_at/write_at/set_len`，让 metadata 指向的连续 data blocks 能读写文件内容。
+7. 改 `FHandle`，删除 `data: Arc<Mutex<Vec<u8>>>`，改成 `fs: Arc<SwapFs>` 和 `meta_index: usize`。
+8. 让 `FHandle::read_at/write_at/metadata_sz/set_len/fallocate` 直接调用 SwapFS。
+9. 改 `FLike::File`，让它只调用 `FHandle` 方法，不直接访问 `FHandle` 内部字段。
+10. 增加 `Kernel` 内部 fd API：`open_file_for_task/read_fd/write_fd`。
+11. 最后再改 `dispatch_syscall` 的 `SYS_OPEN/SYS_READ/SYS_WRITE`。
 
 ## 暂时不做
 
