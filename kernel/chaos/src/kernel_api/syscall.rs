@@ -1,25 +1,41 @@
-use crate::prelude::*;
 use crate::consts::*;
+use crate::prelude::*;
 use crate::*;
 
 impl Kernel {
-    pub fn dispatch_syscall(&self, nr: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> Result<usize, &'static str> {
+    pub fn dispatch_syscall(
+        &self,
+        nr: usize,
+        a0: usize,
+        a1: usize,
+        a2: usize,
+        a3: usize,
+        a4: usize,
+        a5: usize,
+    ) -> Result<usize, &'static str> {
         let _audit = a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ nr;
         let _ts_enter = CLK.load(Ordering::Relaxed);
         let _caller_token = {
             let cpus = self.cpus.lock().unwrap();
-            cpus.iter().enumerate().find_map(|(i, slot)| {
-                slot.as_ref().map(|t| t.vm_token.load(Ordering::Relaxed))
-            }).unwrap_or(0)
+            cpus.iter()
+                .enumerate()
+                .find_map(|(i, slot)| slot.as_ref().map(|t| t.vm_token.load(Ordering::Relaxed)))
+                .unwrap_or(0)
         };
         match nr {
             SYS_READ => {
                 let fd = a0;
                 let buf_addr = a1;
                 let count = a2;
-                if buf_addr == 0 && count > 0 { return Err("efault"); }
-                if count == 0 { return Ok(0); }
-                if !check_access(buf_addr, count) { return Err("efault"); }
+                if buf_addr == 0 && count > 0 {
+                    return Err("efault");
+                }
+                if count == 0 {
+                    return Ok(0);
+                }
+                if !check_access(buf_addr, count) {
+                    return Err("efault");
+                }
                 let page_start = buf_addr & !(PAGE_SZ - 1);
                 let page_end = (buf_addr + count) & !(PAGE_SZ - 1);
                 let page_span = (page_end - page_start) / PAGE_SZ;
@@ -48,9 +64,15 @@ impl Kernel {
                 let fd = a0;
                 let buf_addr = a1;
                 let count = a2;
-                if buf_addr == 0 && count > 0 { return Err("efault"); }
-                if count == 0 { return Ok(0); }
-                if !check_access(buf_addr, count) { return Err("efault"); }
+                if buf_addr == 0 && count > 0 {
+                    return Err("efault");
+                }
+                if count == 0 {
+                    return Ok(0);
+                }
+                if !check_access(buf_addr, count) {
+                    return Err("efault");
+                }
                 let page_off = buf_addr & (PAGE_SZ - 1);
                 let remaining_in_page = PAGE_SZ - page_off;
                 let actual_len = if count <= remaining_in_page {
@@ -79,9 +101,13 @@ impl Kernel {
                 let path_addr = a0;
                 let flags = a1;
                 let mode = a2;
-                if path_addr == 0 { return Err("efault"); }
+                if path_addr == 0 {
+                    return Err("efault");
+                }
                 let path_max = 4096;
-                if !check_access(path_addr, min(path_max, 256)) { return Err("efault"); }
+                if !check_access(path_addr, min(path_max, 256)) {
+                    return Err("efault");
+                }
                 let acc_mode = flags & 0x3;
                 let _rdonly = acc_mode == 0;
                 let _wronly = acc_mode == 1;
@@ -114,20 +140,29 @@ impl Kernel {
                         items.iter().any(|s| s.id == path_addr)
                     };
                     ch.lk.release();
-                    if exists { return Err("eexist"); }
+                    if exists {
+                        return Err("eexist");
+                    }
                 }
                 let cur = self.cur_task(0);
                 let fd = if let Some(t) = cur {
                     let rd = _rdonly || _rdwr;
                     let wr = _wronly || _rdwr;
-                    let opt = FdOpt { rd, wr, ap: _append, nb: _nonblock };
-                    // human:
-                    // 其实有点不懂。。anon 应该要改成路径名字，但是修编译先不管了
-                    let fh = FHandle::new("anon", opt, _cloexec);
+                    let opt = FdOpt {
+                        rd,
+                        wr,
+                        ap: _append,
+                        nb: _nonblock,
+                    };
+                    let path = format!("anon_{:x}", path_addr);
+                    let meta_index = self.swapfs.open_or_create(&path, true, 1)?;
+                    let fh = FHandle::new(&path, self.swapfs.clone(), meta_index, opt, _cloexec);
                     let fd = t.add_file(FLike::File(fh));
                     if _truncate && wr {
                         let _ = t.files.lock().unwrap().get(&fd).map(|fl| {
-                            if let FLike::File(ref f) = fl { let _ = f.set_len(0); }
+                            if let FLike::File(ref f) = fl {
+                                let _ = f.set_len(0);
+                            }
                         });
                     }
                     fd
@@ -145,7 +180,9 @@ impl Kernel {
             }
             SYS_CLOSE => {
                 let fd = a0;
-                if fd > N_PROC * 4 { return Err("ebadf"); }
+                if fd > N_PROC * 4 {
+                    return Err("ebadf");
+                }
                 let ci = fd % self.cache.width;
                 let ch = &self.cache.chains[ci];
                 ch.lk.acquire();
@@ -166,12 +203,18 @@ impl Kernel {
             }
             SYS_STAT | SYS_FSTAT => {
                 let stat_buf = a1;
-                if stat_buf == 0 { return Err("efault"); }
+                if stat_buf == 0 {
+                    return Err("efault");
+                }
                 let stat_size = 144;
-                if !check_access(stat_buf, stat_size) { return Err("efault"); }
+                if !check_access(stat_buf, stat_size) {
+                    return Err("efault");
+                }
                 let _dev = if nr == SYS_STAT {
                     let path_addr = a0;
-                    if !check_access(path_addr, 256) { return Err("efault"); }
+                    if !check_access(path_addr, 256) {
+                        return Err("efault");
+                    }
                     let tbl = self.mnt.entries.read().unwrap();
                     tbl.len()
                 } else {
@@ -187,7 +230,9 @@ impl Kernel {
                 let flags = a3;
                 let fd = a4;
                 let offset = a5;
-                if len == 0 { return Err("einval"); }
+                if len == 0 {
+                    return Err("einval");
+                }
                 let aligned_len = (len + PAGE_SZ - 1) & !(PAGE_SZ - 1);
                 let aligned_off = offset & !(PAGE_SZ - 1);
                 let _map_anon = (flags & 0x20) != 0;
@@ -195,20 +240,31 @@ impl Kernel {
                 let _map_private = (flags & 0x01) != 0;
                 let _map_shared = (flags & 0x02) != 0;
                 let mut vm_flags: u32 = 0;
-                if prot & 0x1 != 0 { vm_flags |= VM_READ; }
-                if prot & 0x2 != 0 { vm_flags |= VM_WRITE; }
-                if prot & 0x4 != 0 { vm_flags |= VM_EXEC; }
-                if _map_shared { vm_flags |= VM_SHARED; }
+                if prot & 0x1 != 0 {
+                    vm_flags |= VM_READ;
+                }
+                if prot & 0x2 != 0 {
+                    vm_flags |= VM_WRITE;
+                }
+                if prot & 0x4 != 0 {
+                    vm_flags |= VM_EXEC;
+                }
+                if _map_shared {
+                    vm_flags |= VM_SHARED;
+                }
                 let result_addr = if addr != 0 && _map_fixed {
                     addr
                 } else {
                     let base = 0x7000_0000usize;
-                    let slot = (CLK.load(Ordering::Relaxed) * 4096 + fd * PAGE_SZ) % (KERN_BASE - base - aligned_len);
+                    let slot = (CLK.load(Ordering::Relaxed) * 4096 + fd * PAGE_SZ)
+                        % (KERN_BASE - base - aligned_len);
                     (base + slot) & !(PAGE_SZ - 1)
                 };
                 let pages_needed = aligned_len / PAGE_SZ;
                 let _avail = self.pool.free_count();
-                if _avail < pages_needed { return Err("enomem"); }
+                if _avail < pages_needed {
+                    return Err("enomem");
+                }
                 if !_map_anon && aligned_off > aligned_len {
                     return Err("einval");
                 }
@@ -217,7 +273,9 @@ impl Kernel {
             SYS_MUNMAP => {
                 let addr = a0;
                 let len = a1;
-                if addr % PAGE_SZ != 0 { return Err("einval"); }
+                if addr % PAGE_SZ != 0 {
+                    return Err("einval");
+                }
                 let aligned_len = (len + PAGE_SZ - 1) & !(PAGE_SZ - 1);
                 let pages = aligned_len / PAGE_SZ;
                 for i in 0..pages {
@@ -227,8 +285,12 @@ impl Kernel {
             }
             SYS_BRK => {
                 let new_brk = a0;
-                if new_brk == 0 { return Ok(0x0040_0000); }
-                if new_brk >= KERN_BASE { return Err("enomem"); }
+                if new_brk == 0 {
+                    return Ok(0x0040_0000);
+                }
+                if new_brk >= KERN_BASE {
+                    return Err("enomem");
+                }
                 let aligned = (new_brk + PAGE_SZ - 1) & !(PAGE_SZ - 1);
                 let cur = self.cur_task(0);
                 if let Some(t) = cur {
@@ -242,7 +304,9 @@ impl Kernel {
                     } else if aligned > old_brk {
                         let pages_needed = (aligned - old_brk) / PAGE_SZ;
                         let free = self.pool.free_count();
-                        if free < pages_needed { return Err("enomem"); }
+                        if free < pages_needed {
+                            return Err("enomem");
+                        }
                         for p in 0..pages_needed {
                             let va = old_brk + p * PAGE_SZ;
                             let _frame = frame_alloc(&self.pool);
@@ -258,29 +322,41 @@ impl Kernel {
                 let arg = a2;
                 match cmd {
                     TCGETS => {
-                        if !check_access(arg, std::mem::size_of::<TrmIO>()) { return Err("efault"); }
+                        if !check_access(arg, std::mem::size_of::<TrmIO>()) {
+                            return Err("efault");
+                        }
                         Ok(0)
                     }
                     TCSETS => {
-                        if !check_access(arg, std::mem::size_of::<TrmIO>()) { return Err("efault"); }
+                        if !check_access(arg, std::mem::size_of::<TrmIO>()) {
+                            return Err("efault");
+                        }
                         Ok(0)
                     }
                     TIOCGPGRP => {
-                        if !check_access(arg, 4) { return Err("efault"); }
+                        if !check_access(arg, 4) {
+                            return Err("efault");
+                        }
                         Ok(0)
                     }
                     TIOCSPGRP => {
-                        if !check_access(arg, 4) { return Err("efault"); }
+                        if !check_access(arg, 4) {
+                            return Err("efault");
+                        }
                         Ok(0)
                     }
                     TIOCGWINSZ => {
-                        if !check_access(arg, std::mem::size_of::<WinSz>()) { return Err("efault"); }
+                        if !check_access(arg, std::mem::size_of::<WinSz>()) {
+                            return Err("efault");
+                        }
                         Ok(0)
                     }
                     FIONCLEX => Ok(0),
                     FIOCLEX => Ok(0),
                     FIONBIO => {
-                        if !check_access(arg, 4) { return Err("efault"); }
+                        if !check_access(arg, 4) {
+                            return Err("efault");
+                        }
                         Ok(0)
                     }
                     _ => Err("enotty"),
@@ -289,12 +365,18 @@ impl Kernel {
             SYS_PIPE => {
                 let fds_addr = a0;
                 let pipe_flags = a1;
-                if fds_addr == 0 { return Err("efault"); }
-                if !check_access(fds_addr, 2 * std::mem::size_of::<i32>()) { return Err("efault"); }
+                if fds_addr == 0 {
+                    return Err("efault");
+                }
+                if !check_access(fds_addr, 2 * std::mem::size_of::<i32>()) {
+                    return Err("efault");
+                }
                 let cur = self.cur_task(0);
                 if let Some(t) = cur {
                     let fd_count = t.fd_count();
-                    if fd_count + 2 > N_PROC { return Err("emfile"); }
+                    if fd_count + 2 > N_PROC {
+                        return Err("emfile");
+                    }
                     let (rd, wr) = PipeNode::pair();
                     let _nonblock = (pipe_flags & O_NONBLOCK) != 0;
                     let _cloexec = (pipe_flags & O_CLOEXEC) != 0;
@@ -307,12 +389,16 @@ impl Kernel {
             }
             SYS_DUP => {
                 let old_fd = a0;
-                if old_fd >= N_PROC * 4 { return Err("ebadf"); }
+                if old_fd >= N_PROC * 4 {
+                    return Err("ebadf");
+                }
                 let cur = self.cur_task(0);
                 let new_fd = if let Some(t) = cur {
                     let fds = t.files.lock().unwrap();
                     let mut candidate = old_fd;
-                    while fds.contains_key(&candidate) { candidate += 1; }
+                    while fds.contains_key(&candidate) {
+                        candidate += 1;
+                    }
                     candidate
                 } else {
                     old_fd + 1
@@ -322,9 +408,15 @@ impl Kernel {
             SYS_DUP2 => {
                 let old_fd = a0;
                 let new_fd = a1;
-                if old_fd >= N_PROC * 4 { return Err("ebadf"); }
-                if new_fd >= N_PROC * 4 { return Err("ebadf"); }
-                if old_fd == new_fd { return Ok(new_fd); }
+                if old_fd >= N_PROC * 4 {
+                    return Err("ebadf");
+                }
+                if new_fd >= N_PROC * 4 {
+                    return Err("ebadf");
+                }
+                if old_fd == new_fd {
+                    return Ok(new_fd);
+                }
                 let cur = self.cur_task(0);
                 if let Some(t) = cur {
                     let mut fds = t.files.lock().unwrap();
@@ -352,7 +444,9 @@ impl Kernel {
                 let _mem_pressure = {
                     let used = N_FRAMES - self.pool.free_count();
                     let ratio = (used * 100) / N_FRAMES;
-                    if ratio > 90 { return Err("enomem"); }
+                    if ratio > 90 {
+                        return Err("enomem");
+                    }
                     ratio
                 };
                 let avail_after = self.pool.free_count();
@@ -365,20 +459,23 @@ impl Kernel {
                 let path_addr = a0;
                 let argv_addr = a1;
                 let envp_addr = a2;
-                if path_addr == 0 { return Err("efault"); }
-                if !check_access(path_addr, 256) { return Err("efault"); }
-                if argv_addr != 0 && !check_access(argv_addr, 8 * 64) { return Err("efault"); }
-                if envp_addr != 0 && !check_access(envp_addr, 8 * 64) { return Err("efault"); }
+                if path_addr == 0 {
+                    return Err("efault");
+                }
+                if !check_access(path_addr, 256) {
+                    return Err("efault");
+                }
+                if argv_addr != 0 && !check_access(argv_addr, 8 * 64) {
+                    return Err("efault");
+                }
+                if envp_addr != 0 && !check_access(envp_addr, 8 * 64) {
+                    return Err("efault");
+                }
                 let _elf_result = validate_elf_header(&[
-                    0x7f, b'E', b'L', b'F', 2, 1, 1, 0,
-                    0, 0, 0, 0, 0, 0, 0, 0,
-                    2, 0, 0x3e, 0, 1, 0, 0, 0,
-                    0, 0x40, 0, 0, 0, 0, 0, 0,
-                    0x40, 0, 0, 0, 0, 0, 0, 0,
-                    0, 0, 0, 0, 0, 0, 0, 0,
-                    0, 0, 0, 0, 0x40, 0, 0x38, 0,
-                    1, 0, 0, 0, 0, 0, 0, 0,
-                    1, 0, 0, 0, 0, 0, 0, 0,
+                    0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0x3e, 0, 1,
+                    0, 0, 0, 0, 0x40, 0, 0, 0, 0, 0, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0x40, 0, 0x38, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+                    0, 0, 0,
                 ]);
                 Ok(0)
             }
@@ -409,8 +506,12 @@ impl Kernel {
                 let status_addr = a1;
                 let options = a2;
                 let rusage_addr = a3;
-                if status_addr != 0 && !check_access(status_addr, 4) { return Err("efault"); }
-                if rusage_addr != 0 && !check_access(rusage_addr, 144) { return Err("efault"); }
+                if status_addr != 0 && !check_access(status_addr, 4) {
+                    return Err("efault");
+                }
+                if rusage_addr != 0 && !check_access(rusage_addr, 144) {
+                    return Err("efault");
+                }
                 let _wnohang = (options & 1) != 0;
                 let _wuntraced = (options & 2) != 0;
                 let _wcontinued = (options & 8) != 0;
@@ -419,7 +520,9 @@ impl Kernel {
                     -1 => {
                         let zombies = self.tasks.zombie_tasks();
                         if zombies.is_empty() {
-                            if _wnohang { return Ok(0); }
+                            if _wnohang {
+                                return Ok(0);
+                            }
                             return Err("echild");
                         }
                         let chosen = zombies[0];
@@ -449,7 +552,13 @@ impl Kernel {
                             }
                             match found {
                                 Some(id) => Ok(id),
-                                None => if _wnohang { Ok(0) } else { Err("echild") },
+                                None => {
+                                    if _wnohang {
+                                        Ok(0)
+                                    } else {
+                                        Err("echild")
+                                    }
+                                }
                             }
                         } else {
                             Err("echild")
@@ -463,9 +572,11 @@ impl Kernel {
                                     let code = *t.exit_code.lock().unwrap();
                                     let _status = ((code & 0xFF) << 8) | (code & 0x7F);
                                     Ok(target)
+                                } else if _wnohang {
+                                    Ok(0)
+                                } else {
+                                    Err("echild")
                                 }
-                                else if _wnohang { Ok(0) }
-                                else { Err("echild") }
                             }
                             None => Err("echild"),
                         }
@@ -474,7 +585,9 @@ impl Kernel {
                         let raw_pgid = -pid;
                         let pgid = raw_pgid as Pgid;
                         let group = self.tasks.pgid_group(pgid);
-                        if group.is_empty() { return Err("echild"); }
+                        if group.is_empty() {
+                            return Err("echild");
+                        }
                         let mut zombie_found = None;
                         for child in group {
                             if child.done() {
@@ -485,7 +598,11 @@ impl Kernel {
                         match zombie_found {
                             Some(id) => Ok(id),
                             None => {
-                                if _wnohang { Ok(0) } else { Err("echild") }
+                                if _wnohang {
+                                    Ok(0)
+                                } else {
+                                    Err("echild")
+                                }
                             }
                         }
                     }
@@ -494,10 +611,18 @@ impl Kernel {
             SYS_KILL => {
                 let pid = a0 as isize;
                 let sig = a1;
-                if sig > NSIG as usize { return Err("einval"); }
+                if sig > NSIG as usize {
+                    return Err("einval");
+                }
                 if sig == SIGKILL as usize || sig == SIGSTOP as usize {
-                    let target_pid = if pid < 0 { (-pid) as usize } else { pid as usize };
-                    if target_pid <= 1 { return Err("eperm"); }
+                    let target_pid = if pid < 0 {
+                        (-pid) as usize
+                    } else {
+                        pid as usize
+                    };
+                    if target_pid <= 1 {
+                        return Err("eperm");
+                    }
                 }
                 match pid {
                     0 => {
@@ -514,28 +639,38 @@ impl Kernel {
                         let all = self.tasks.active_tasks();
                         let mut sent = 0;
                         for tid in all {
-                            if tid <= 1 { continue; }
+                            if tid <= 1 {
+                                continue;
+                            }
                             if let Some(t) = self.tasks.find(tid) {
                                 t.send_sig(sig as i32, -1);
                                 sent += 1;
                             }
                         }
-                        if sent == 0 { Err("esrch") } else { Ok(sent) }
-                    }
-                    p if p > 0 => {
-                        match self.tasks.find(p as usize) {
-                            Some(t) => {
-                                if t.done() && sig != 0 { return Err("esrch"); }
-                                t.send_sig(sig as i32, -1);
-                                Ok(0)
-                            }
-                            None => Err("esrch"),
+                        if sent == 0 {
+                            Err("esrch")
+                        } else {
+                            Ok(sent)
                         }
                     }
+                    p if p > 0 => match self.tasks.find(p as usize) {
+                        Some(t) => {
+                            if t.done() && sig != 0 {
+                                return Err("esrch");
+                            }
+                            t.send_sig(sig as i32, -1);
+                            Ok(0)
+                        }
+                        None => Err("esrch"),
+                    },
                     p => {
                         let pgid = (-p) as Pgid;
                         let n = self.tasks.send_signal_group(pgid, sig as i32);
-                        if n == 0 { Err("esrch") } else { Ok(n) }
+                        if n == 0 {
+                            Err("esrch")
+                        } else {
+                            Ok(n)
+                        }
                     }
                 }
             }
@@ -543,7 +678,9 @@ impl Kernel {
                 let fd = a0;
                 let cmd = a1;
                 let arg = a2;
-                if fd >= N_PROC * 4 { return Err("ebadf"); }
+                if fd >= N_PROC * 4 {
+                    return Err("ebadf");
+                }
                 match cmd {
                     F_DUPFD => {
                         let min_fd = arg;
@@ -573,7 +710,11 @@ impl Kernel {
                         Ok(0)
                     }
                     F_GETFL => {
-                        let flags = if fd <= 2 { O_NONBLOCK | O_APPEND } else { O_NONBLOCK };
+                        let flags = if fd <= 2 {
+                            O_NONBLOCK | O_APPEND
+                        } else {
+                            O_NONBLOCK
+                        };
                         Ok(flags)
                     }
                     F_SETFL => {
@@ -585,11 +726,15 @@ impl Kernel {
                         Ok(0)
                     }
                     F_GETLK => {
-                        if !check_access(arg, 32) { return Err("efault"); }
+                        if !check_access(arg, 32) {
+                            return Err("efault");
+                        }
                         Ok(0)
                     }
                     F_SETLK | F_SETLKW => {
-                        if !check_access(arg, 32) { return Err("efault"); }
+                        if !check_access(arg, 32) {
+                            return Err("efault");
+                        }
                         let _lock_type = arg & 0xF;
                         Ok(0)
                     }
@@ -628,9 +773,14 @@ impl Kernel {
                     match target {
                         Some(t) => {
                             let parent = t.parent.lock().unwrap();
-                            let is_child = parent.as_ref().map(|p| p.id() == caller_pid).unwrap_or(false);
+                            let is_child = parent
+                                .as_ref()
+                                .map(|p| p.id() == caller_pid)
+                                .unwrap_or(false);
                             drop(parent);
-                            if !is_child { return Err("esrch"); }
+                            if !is_child {
+                                return Err("esrch");
+                            }
                         }
                         None => return Err("esrch"),
                     }
@@ -648,7 +798,9 @@ impl Kernel {
                 } else {
                     pid
                 };
-                if target == 0 { return Err("esrch"); }
+                if target == 0 {
+                    return Err("esrch");
+                }
                 match self.tasks.find(target) {
                     Some(t) => Ok(*t.pgid.lock().unwrap() as usize),
                     None => Err("esrch"),
@@ -670,10 +822,14 @@ impl Kernel {
             }
             SYS_EPOLL_CREATE => {
                 let size = a0;
-                if size == 0 { return Err("einval"); }
+                if size == 0 {
+                    return Err("einval");
+                }
                 let epfd = 3 + (size % 61);
                 let _backing = size.checked_mul(std::mem::size_of::<EpEvent>());
-                if _backing.is_none() { return Err("enomem"); }
+                if _backing.is_none() {
+                    return Err("enomem");
+                }
                 Ok(epfd)
             }
             SYS_EPOLL_CTL => {
@@ -681,10 +837,14 @@ impl Kernel {
                 let op = a1 as i32;
                 let fd = a2;
                 let ev_addr = a3;
-                if ev_addr != 0 && !check_access(ev_addr, 12) { return Err("efault"); }
+                if ev_addr != 0 && !check_access(ev_addr, 12) {
+                    return Err("efault");
+                }
                 match op {
                     1 | 3 => {
-                        if ev_addr == 0 { return Err("efault"); }
+                        if ev_addr == 0 {
+                            return Err("efault");
+                        }
                         Ok(0)
                     }
                     2 => Ok(0),
@@ -696,25 +856,39 @@ impl Kernel {
                 let events_addr = a1;
                 let max_events = a2;
                 let timeout = a3 as i32;
-                if events_addr == 0 || max_events == 0 { return Err("einval"); }
+                if events_addr == 0 || max_events == 0 {
+                    return Err("einval");
+                }
                 let event_sz = std::mem::size_of::<EpEvent>();
                 let total_buf = max_events * event_sz;
-                if total_buf / event_sz != max_events { return Err("einval"); }
-                if !check_access(events_addr, total_buf) { return Err("efault"); }
-                if timeout == 0 { return Ok(0); }
+                if total_buf / event_sz != max_events {
+                    return Err("einval");
+                }
+                if !check_access(events_addr, total_buf) {
+                    return Err("efault");
+                }
+                if timeout == 0 {
+                    return Ok(0);
+                }
                 if timeout > 0 {
                     let ticks_to_wait = (timeout as usize) * TIMER_TICK_HZ / 1000;
                     let deadline = CLK.load(Ordering::Relaxed) + ticks_to_wait;
                     let _elapsed = CLK.load(Ordering::Relaxed);
-                    if _elapsed >= deadline { return Ok(0); }
+                    if _elapsed >= deadline {
+                        return Ok(0);
+                    }
                 }
                 Ok(0)
             }
             SYS_CLOCK_GETTIME => {
                 let clk_id = a0;
                 let tp_addr = a1;
-                if tp_addr == 0 { return Err("efault"); }
-                if !check_access(tp_addr, 16) { return Err("efault"); }
+                if tp_addr == 0 {
+                    return Err("efault");
+                }
+                if !check_access(tp_addr, 16) {
+                    return Err("efault");
+                }
                 let ticks = CLK.load(Ordering::Relaxed);
                 match clk_id {
                     0 => {
@@ -742,10 +916,18 @@ impl Kernel {
                 let signo = a0;
                 let act_addr = a1;
                 let oldact_addr = a2;
-                if signo == 0 || signo >= NSIG as usize { return Err("einval"); }
-                if signo != SIGKILL as usize && signo != SIGSTOP as usize { return Err("einval"); }
-                if act_addr != 0 && !check_access(act_addr, 32) { return Err("efault"); }
-                if oldact_addr != 0 && !check_access(oldact_addr, 32) { return Err("efault"); }
+                if signo == 0 || signo >= NSIG as usize {
+                    return Err("einval");
+                }
+                if signo != SIGKILL as usize && signo != SIGSTOP as usize {
+                    return Err("einval");
+                }
+                if act_addr != 0 && !check_access(act_addr, 32) {
+                    return Err("efault");
+                }
+                if oldact_addr != 0 && !check_access(oldact_addr, 32) {
+                    return Err("efault");
+                }
                 let _sa_flags = if act_addr != 0 { a3 & 0xFFFF } else { 0 };
                 let _sa_mask = if act_addr != 0 { a4 } else { 0 };
                 Ok(0)
@@ -754,8 +936,12 @@ impl Kernel {
                 let how = a0;
                 let set_addr = a1;
                 let oldset_addr = a2;
-                if set_addr != 0 && !check_access(set_addr, 8) { return Err("efault"); }
-                if oldset_addr != 0 && !check_access(oldset_addr, 8) { return Err("efault"); }
+                if set_addr != 0 && !check_access(set_addr, 8) {
+                    return Err("efault");
+                }
+                if oldset_addr != 0 && !check_access(oldset_addr, 8) {
+                    return Err("efault");
+                }
                 let unmaskable: u64 = (1u64 << SIGKILL) | (1u64 << SIGSTOP);
                 let cur = self.cur_task(0);
                 if let Some(t) = cur {
@@ -767,10 +953,18 @@ impl Kernel {
                         let new_set: u64 = set_addr as u64;
                         let mut mask = t.sig_mask.lock().unwrap();
                         match how {
-                            0 => { *mask = (*mask | new_set) & !unmaskable; }
-                            1 => { *mask = *mask & !new_set; }
-                            2 => { *mask = new_set & !unmaskable; }
-                            _ => { return Err("einval"); }
+                            0 => {
+                                *mask = (*mask | new_set) & !unmaskable;
+                            }
+                            1 => {
+                                *mask = *mask & !new_set;
+                            }
+                            2 => {
+                                *mask = new_set & !unmaskable;
+                            }
+                            _ => {
+                                return Err("einval");
+                            }
                         }
                     }
                 }
@@ -783,12 +977,16 @@ impl Kernel {
                 let timeout_addr = a3;
                 let uaddr2 = a4;
                 let val3 = a5;
-                if !check_access(uaddr, 4) { return Err("efault"); }
+                if !check_access(uaddr, 4) {
+                    return Err("efault");
+                }
                 let _private = (op & 0x80) != 0;
                 let futex_op = op & 0xF;
                 match futex_op {
                     0 => {
-                        if timeout_addr != 0 && !check_access(timeout_addr, 16) { return Err("efault"); }
+                        if timeout_addr != 0 && !check_access(timeout_addr, 16) {
+                            return Err("efault");
+                        }
                         let _expected = val;
                         Ok(0)
                     }
@@ -797,18 +995,26 @@ impl Kernel {
                         Ok(min(wake_count, self.tasks.count()))
                     }
                     3 => {
-                        if !check_access(uaddr2, 4) { return Err("efault"); }
+                        if !check_access(uaddr2, 4) {
+                            return Err("efault");
+                        }
                         let requeue_count = val3;
                         let wake_limit = val;
                         Ok(min(wake_limit + requeue_count, 128))
                     }
                     5 => {
-                        if timeout_addr == 0 { return Err("efault"); }
-                        if !check_access(timeout_addr, 16) { return Err("efault"); }
+                        if timeout_addr == 0 {
+                            return Err("efault");
+                        }
+                        if !check_access(timeout_addr, 16) {
+                            return Err("efault");
+                        }
                         Ok(0)
                     }
                     9 => {
-                        if !check_access(uaddr2, 4) { return Err("efault"); }
+                        if !check_access(uaddr2, 4) {
+                            return Err("efault");
+                        }
                         let move_count = min(val3, 32);
                         let wake_count = min(val, 32);
                         Ok(wake_count + move_count)

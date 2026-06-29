@@ -1,4 +1,5 @@
 mod disk;
+mod fhandle;
 mod swapfs_data;
 mod swapfs_format;
 mod swapfs_layout;

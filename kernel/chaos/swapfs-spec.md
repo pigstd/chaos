@@ -252,16 +252,17 @@ pub enum FLike {
 
 ### `fs/fd.rs`
 
-当前 `FHandle` 保存：
+当前 `FHandle` 已经保存：
 
 ```rust
 path: String
-data: Arc<Mutex<Vec<u8>>>
+fs: Arc<SwapFs>
+meta_index: usize
 desc: Arc<RwLock<FdState>>
 cloexec: bool
 ```
 
-SwapFS 接入后，`FHandle` 应该直接变成 SwapFS 普通文件句柄，不再保留 memory-backed 普通文件设计。第一版目标结构：
+`FHandle` 是 SwapFS 普通文件句柄，不再保留 memory-backed 普通文件设计。当前结构：
 
 ```rust
 pub struct FHandle {
@@ -283,14 +284,14 @@ desc       = open-file state，保存 offset 和 open flags
 cloexec    = exec 时是否关闭
 ```
 
-`FHandle::read_at/write_at/metadata_sz/set_len/fallocate` 需要改为调用 SwapFS：
+`FHandle::read_at/write_at/metadata_sz/set_len/fallocate` 已经改为调用 SwapFS：
 
 ```text
 read_at      -> self.fs.read_at(self.meta_index, off, buf)
 write_at     -> self.fs.write_at(self.meta_index, off, buf)
 metadata_sz  -> self.fs.metadata_len(self.meta_index)
 set_len      -> self.fs.set_len(self.meta_index, len)
-fallocate    -> self.fs.ensure_capacity(self.meta_index, offset + len)
+fallocate    -> self.fs.set_len(self.meta_index, offset + len)   // v1 暂时会改变可见 size
 ```
 
 `FHandle::new` 应该变成创建 SwapFS 句柄的构造函数，例如：
@@ -299,7 +300,7 @@ fallocate    -> self.fs.ensure_capacity(self.meta_index, offset + len)
 pub fn new(path: &str, fs: Arc<SwapFs>, meta_index: usize, opt: FdOpt, cloexec: bool) -> Self;
 ```
 
-`FHandle::with_data`、`data: Arc<Mutex<Vec<u8>>>`、`inode_ref()` 这类内存文件接口应删除或迁移到测试辅助代码，不再作为普通文件系统路径的一部分。
+`FHandle::with_data` 和 `data: Arc<Mutex<Vec<u8>>>` 已删除。`inode_ref()` 暂时返回 `(Arc<SwapFs>, meta_index)`，只是兼容旧名字；后续有 VFS/inode 时应改成真正 inode 引用。
 
 `FHandle` 第一阶段先只完成普通文件读写必须依赖的基础方法：
 
@@ -321,12 +322,12 @@ pub fn new(path: &str, fs: Arc<SwapFs>, meta_index: usize, opt: FdOpt, cloexec: 
 | --- | --- |
 | `sync_all/sync_data` | 可以先调用 `SwapFs::sync_meta` 和 `Disk::flush`，或者保守返回 `Ok(())` 并注释为 stub |
 | `lookup/read_entry` | SwapFS v1 没有目录，先返回 `Err("enosys")` 或保留只用于旧测试的 stub |
-| `poll_status` | 普通文件按 open flags 认为 always-ready，error 固定 false |
+| `poll_status` | 普通文件按 open flags 认为 ready；metadata 读失败时报告 error |
 | `io_ctl` | 普通文件返回 `Err("enotty")` 更合理；tty/device 后续自己实现 ioctl |
 | `mmap` | 返回 `Err("enosys")`，等 VM/page cache 后再做 |
-| `inode_ref` | 删除；SwapFS v1 没有 inode object 可返回 |
+| `inode_ref` | 暂时返回 `(Arc<SwapFs>, meta_index)`；后续 VFS 化时改名或删除 |
 | `advise_readahead` | 返回 `Ok(())` 或 `Err("enosys")`，不做真实预读 |
-| `fallocate` | 如果 `SwapFs::ensure_capacity` 已实现就接入；否则先返回 `Err("enosys")` |
+| `fallocate` | v1 暂时通过 `SwapFs::set_len` 实现，会改变可见 size |
 | `splice_to` | 可以用 `read` + `dst.write` 实现；不直接访问任何内部 backing |
 
 迁移时需要逐个处理当前依赖 `data` 的方法：
@@ -339,9 +340,9 @@ pub fn new(path: &str, fs: Arc<SwapFs>, meta_index: usize, opt: FdOpt, cloexec: 
 | `seek(End)` | 用 `data.len()` | 用 SwapFS metadata size |
 | `set_len` | resize `Vec<u8>` | 调 `SwapFs::set_len`，必要时扩容分配块 |
 | `metadata_sz` | 返回 `Vec<u8>.len()` | 返回 metadata 里的 `size` |
-| `poll_status` | 检查 `data` 推断 error | 普通文件第一版可按 open flags 返回 ready，error 固定 false |
+| `poll_status` | 检查 `data` 推断 error | 按 open flags 返回 ready，metadata 读失败时报 error |
 | `sync_all/sync_data` | 空实现 | 至少调用 `SwapFs::sync_meta` 和 `Disk::flush` |
-| `fallocate` | resize `Vec<u8>` | 调 `SwapFs::ensure_capacity` |
+| `fallocate` | resize `Vec<u8>` | 当前调 `SwapFs::set_len`，后续再拆成只保留 capacity 的语义 |
 | `splice_to` | 直接从 `data` 复制 | 通过 `read` + `dst.write` 做，不直接看内部字段 |
 
 `lookup`、`read_entry` 暂时不应该继续挂在普通文件 `FHandle` 上实现目录语义。SwapFS v1 没有目录，可以先保留为 stub；后续有目录时应该挪到目录文件或 VFS/inode 层。
@@ -364,7 +365,7 @@ FLike::File(f) => f.read(...)
 FLike::File(f) => f.write(...)
 ```
 
-但当前实现直接访问 `f.data` 和 `f.desc`。接入 SwapFS 后，应改为调用 `FHandle` 方法，而不是在 `FLike` 里展开普通文件细节：
+`FLike::File` 应调用 `FHandle` 方法，而不是在 `FLike` 里展开普通文件细节：
 
 ```rust
 FLike::File(f) => f.read(buf)
@@ -375,40 +376,33 @@ FLike::File(f) => f.write(buf)
 
 ### `kernel_api/lifecycle.rs`
 
-`Kernel` 需要持有一个默认 SwapFS：
+`Kernel` 已经持有一个默认 SwapFS：
 
 ```rust
+pub disk: Arc<Disk>,
 pub swapfs: Arc<SwapFs>,
 ```
 
-初始化建议：
+当前初始化：
 
 ```text
 Kernel::new(nf)
-  -> Disk::new("swapfs0", blocks, 512)
-  -> SwapFs::mount_or_format(disk)
+  -> Arc::new(Disk::new("", 1024, SWAPFS_BLOCK_SIZE))
+  -> SwapFs::mount_or_format(disk, 1024, 128)
 ```
-
-为了不一次性破坏现有测试，也可以先新增：
-
-```rust
-pub fn with_swapfs(nf: usize, blocks: usize) -> Self
-```
-
-然后让新测试使用 `Kernel::with_swapfs(...)`。
 
 ### `kernel_api/syscall.rs`
 
 当前 `SYS_OPEN/SYS_READ/SYS_WRITE` 主要是 mock。
 
-第一版需要把文件路径接到 fd table：
+当前 `SYS_OPEN` 已经会创建 SwapFS-backed `FHandle`，但还没有从用户地址空间读取真实路径字符串；它临时把 `path_addr` 编成 `anon_<addr>` 作为 flat 文件名。下一步应该先做内核内部 fd API，再把真实 syscall 的用户内存路径读取接进去。
 
 ```text
 SYS_OPEN:
   1. 校验 path_addr。
-  2. 第一版如果还没有用户内存字符串读取，可以临时用测试辅助路径，或新增内核内部 open API。
+  2. 暂时用 anon_<path_addr> 作为路径名。
   3. 不经过 `MountTable`，直接把 path normalize 成 SwapFS v1 支持的根目录文件名。
-  4. 调 SwapFs::open_or_create(name, flags) 得到 meta_index。
+  4. 调 Kernel.swapfs.open_or_create(name, true, initial_blocks) 得到 meta_index。
   5. 创建 FHandle::new(path, fs, meta_index, opt, cloexec)。
   6. 插入当前 Task.files，返回 fd。
 
