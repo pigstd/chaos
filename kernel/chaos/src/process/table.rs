@@ -136,14 +136,11 @@ impl TaskTable {
         let sp = init.push_at(USR_STK_OFF + USR_STK_SZ);
         ctx.uctx.set_sp(sp as u64);
         *t.thd_ctx.lock().unwrap() = Some(ctx);
-        let fd0 = FHandle::new("/dev/tty", FdOpt { rd: true, wr: false, ap: false, nb: false }, false);
-        let fd1 = FHandle::new("/dev/tty", FdOpt { rd: false, wr: true, ap: false, nb: false }, false);
-        let fd2 = fd1.dup(false);
         {
             let mut fl = t.files.lock().unwrap();
-            fl.insert(0, FLike::File(fd0));
-            fl.insert(1, FLike::File(fd1));
-            fl.insert(2, FLike::File(fd2));
+            fl.insert(0, FLike::Tty(TtyHandle::stdin()));
+            fl.insert(1, FLike::Tty(TtyHandle::stdout()));
+            fl.insert(2, FLike::Tty(TtyHandle::stderr()));
         }
         self.register(&t, Pid(t.id()));
         t.threads.lock().unwrap().push(t.id());

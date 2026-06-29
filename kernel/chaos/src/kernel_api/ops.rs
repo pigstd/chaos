@@ -196,6 +196,7 @@ impl Kernel {
                 .filter_map(|(&fd, fl)| {
                     match fl {
                         FLike::File(fh) if fh.cloexec => Some(fd),
+                        FLike::Tty(tty) if tty.cloexec => Some(fd),
                         _ => None,
                     }
                 })

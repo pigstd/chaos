@@ -31,6 +31,7 @@ pub fn audit_fd_table(files: &BTreeMap<usize, FLike>) -> Vec<usize> {
 #[derive(Clone)]
 pub enum FLike {
     File(FHandle),
+    Tty(TtyHandle),
     Pipe(PipeNode),
     Ep(EpInst),
 }
@@ -43,6 +44,7 @@ impl FLike {
                 // HUMAN
                 FLike::File(f.dup(cloexec))
             }
+            FLike::Tty(t) => FLike::Tty(t.dup(cloexec)),
             FLike::Pipe(p) => {
                 let cloned = PipeNode { data: p.data.clone(), dir: p.dir.clone() };
                 FLike::Pipe(cloned)
@@ -65,6 +67,7 @@ impl FLike {
                 // HUMAN
                 f.read(buf)
             }
+            FLike::Tty(t) => t.read(buf),
             FLike::Pipe(p) => {
                 if p.dir != PipeDir::Rd { return Ok(0); }
                 let mut d = p.data.lock().unwrap();
@@ -93,6 +96,7 @@ impl FLike {
                 // HUMAN
                 f.write(buf)
             }
+            FLike::Tty(t) => t.write(buf),
             FLike::Pipe(p) => {
                 if p.dir != PipeDir::Wr { return Ok(0); }
                 let mut d = p.data.lock().unwrap();
@@ -115,6 +119,7 @@ impl FLike {
     pub fn io_ctl(&self, req: usize, a1: usize) -> Result<usize, &'static str> {
         match self {
             FLike::File(f) => f.io_ctl(req as u32, a1),
+            FLike::Tty(t) => t.io_ctl(req, a1),
             FLike::Pipe(_) => {
                 match req {
                     0x5421 => Ok(0),
@@ -140,6 +145,7 @@ impl FLike {
     pub fn poll(&self) -> (bool, bool, bool) {
         match self {
             FLike::File(f) => f.poll_status(),
+            FLike::Tty(t) => t.poll_status(),
             FLike::Pipe(p) => {
                 let d = p.data.lock().unwrap();
                 let has_data = !d.buf.is_empty();
@@ -162,6 +168,7 @@ impl fmt::Debug for FLike {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             FLike::File(h) => write!(f, "F({:?})", h),
+            FLike::Tty(t) => write!(f, "T({:?})", t),
             FLike::Pipe(_) => write!(f, "P"),
             FLike::Ep(_) => write!(f, "E"),
         }
