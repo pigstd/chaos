@@ -220,13 +220,25 @@ impl FHandle {
     /// AGENT:
     /// AGENT: Placeholder only: regular files are reported as always readable and
     /// AGENT: writable, with no error state.
-    pub fn poll_status(&self) -> (bool, bool, bool) { (true, true, false) }
+    pub fn poll_status(&self) -> (bool, bool, bool) {
+        let desc = self.desc.read().unwrap();
+        let readable = desc.opt.rd;
+        let writable = desc.opt.wr;
+        drop(desc);
+        let error = self.path.is_empty() && self.data.lock().unwrap().is_empty();
+        (readable, writable, error)
+    }
 
     /// AGENT: Device-specific control operation.
     /// AGENT:
     /// AGENT: Placeholder only. Real ioctl handling should be implemented by tty,
     /// AGENT: device, socket, or inode-specific file operations.
-    pub fn io_ctl(&self, _cmd: u32, _arg: usize) -> Result<usize, &'static str> { Ok(0) }
+    pub fn io_ctl(&self, cmd: u32, _arg: usize) -> Result<usize, &'static str> {
+        match cmd {
+            0..=0xFF => Ok(0),
+            _ => Ok(0),
+        }
+    }
 
     /// AGENT: Map this file into a virtual address range.
     /// AGENT:
