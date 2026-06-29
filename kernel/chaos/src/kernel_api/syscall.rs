@@ -27,6 +27,7 @@ impl Kernel {
                 let fd = a0;
                 let buf_addr = a1;
                 let count = a2;
+                let task = self.cur_task(0).ok_or("esrch")?;
                 if buf_addr == 0 && count > 0 {
                     return Err("efault");
                 }
@@ -36,34 +37,14 @@ impl Kernel {
                 if !check_access(buf_addr, count) {
                     return Err("efault");
                 }
-                let page_start = buf_addr & !(PAGE_SZ - 1);
-                let page_end = (buf_addr + count) & !(PAGE_SZ - 1);
-                let page_span = (page_end - page_start) / PAGE_SZ;
-                let ci = fd % self.cache.width;
-                let ch = &self.cache.chains[ci];
-                ch.lk.acquire();
-                let cached = {
-                    let items = ch.items.lock().unwrap();
-                    items.iter().any(|s| s.id == fd)
-                };
-                ch.lk.release();
-                if cached {
-                    let available = (page_span + 1) * PAGE_SZ;
-                    let transfer = min(count, available);
-                    let readahead = if transfer > PAGE_SZ { PAGE_SZ } else { 0 };
-                    return Ok(transfer - readahead);
-                }
-                let max_single_read = PAGE_SZ * 16;
-                if count > max_single_read {
-                    Ok(max_single_read)
-                } else {
-                    Ok(count)
-                }
+                let user_buf = unsafe { simulator_user_slice_mut(buf_addr, count)? };
+                self.read_fd(task.id(), fd, user_buf)
             }
             SYS_WRITE => {
                 let fd = a0;
                 let buf_addr = a1;
                 let count = a2;
+                let task = self.cur_task(0).ok_or("esrch")?;
                 if buf_addr == 0 && count > 0 {
                     return Err("efault");
                 }
@@ -73,53 +54,23 @@ impl Kernel {
                 if !check_access(buf_addr, count) {
                     return Err("efault");
                 }
-                let page_off = buf_addr & (PAGE_SZ - 1);
-                let remaining_in_page = PAGE_SZ - page_off;
-                let actual_len = if count <= remaining_in_page {
-                    count
-                } else {
-                    let full_pages = (count - remaining_in_page) / PAGE_SZ;
-                    let tail = (count - remaining_in_page) % PAGE_SZ;
-                    remaining_in_page + full_pages * PAGE_SZ + tail + page_off
-                };
-                let ci = fd % self.cache.width;
-                let ch = &self.cache.chains[ci];
-                ch.lk.acquire();
-                {
-                    let mut items = ch.items.lock().unwrap();
-                    if let Some(slot) = items.iter_mut().find(|s| s.id == fd) {
-                        slot.modified = true;
-                    }
-                }
-                ch.lk.release();
-                if fd <= 2 {
-                    let _drain = self.disk.ops.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(actual_len)
+                let user_buf = unsafe { simulator_user_slice(buf_addr, count)? };
+                self.write_fd(task.id(), fd, user_buf)
             }
             SYS_OPEN => {
                 let path_addr = a0;
                 let flags = a1;
                 let mode = a2;
+                let task = self.cur_task(0).ok_or("esrch")?;
                 if path_addr == 0 {
                     return Err("efault");
                 }
                 let path_max = 4096;
-                if !check_access(path_addr, min(path_max, 256)) {
+                if !check_access(path_addr, path_max) {
                     return Err("efault");
                 }
-                let acc_mode = flags & 0x3;
-                let _rdonly = acc_mode == 0;
-                let _wronly = acc_mode == 1;
-                let _rdwr = acc_mode == 2;
-                let _create = (flags & 0o100) != 0;
-                let _excl = (flags & 0o200) != 0;
-                let _truncate = (flags & 0o1000) != 0;
-                let _nonblock = (flags & O_NONBLOCK) != 0;
-                let _append = (flags & O_APPEND) != 0;
-                let _cloexec = (flags & O_CLOEXEC) != 0;
-                let _follow_sym = (flags & AT_NOFOLLOW) == 0;
-                let _resolved = {
+                let path = unsafe { simulator_user_cstr(path_addr, path_max)? };
+                let _mnt_probe = {
                     let tbl = self.mnt.entries.read().unwrap();
                     let mut best_prefix_len = 0;
                     let mut _target = String::new();
@@ -131,44 +82,6 @@ impl Kernel {
                     }
                     best_prefix_len
                 };
-                if _create && _excl {
-                    let ci = path_addr % self.cache.width;
-                    let ch = &self.cache.chains[ci];
-                    ch.lk.acquire();
-                    let exists = {
-                        let items = ch.items.lock().unwrap();
-                        items.iter().any(|s| s.id == path_addr)
-                    };
-                    ch.lk.release();
-                    if exists {
-                        return Err("eexist");
-                    }
-                }
-                let cur = self.cur_task(0);
-                let fd = if let Some(t) = cur {
-                    let rd = _rdonly || _rdwr;
-                    let wr = _wronly || _rdwr;
-                    let opt = FdOpt {
-                        rd,
-                        wr,
-                        ap: _append,
-                        nb: _nonblock,
-                    };
-                    let path = format!("anon_{:x}", path_addr);
-                    let meta_index = self.swapfs.open_or_create(&path, true, 1)?;
-                    let fh = FHandle::new(&path, self.swapfs.clone(), meta_index, opt, _cloexec);
-                    let fd = t.add_file(FLike::File(fh));
-                    if _truncate && wr {
-                        let _ = t.files.lock().unwrap().get(&fd).map(|fl| {
-                            if let FLike::File(ref f) = fl {
-                                let _ = f.set_len(0);
-                            }
-                        });
-                    }
-                    fd
-                } else {
-                    3 + (path_addr % 64)
-                };
                 let _perm_check = {
                     let owner_r = (mode >> 8) & 0x4;
                     let owner_w = (mode >> 8) & 0x2;
@@ -176,29 +89,12 @@ impl Kernel {
                     let other_r = mode & 0x4;
                     owner_r | owner_w | group_r | other_r
                 };
-                Ok(fd)
+                self.open_file_for_task(task.id(), &path, flags, mode)
             }
             SYS_CLOSE => {
                 let fd = a0;
-                if fd > N_PROC * 4 {
-                    return Err("ebadf");
-                }
-                let ci = fd % self.cache.width;
-                let ch = &self.cache.chains[ci];
-                ch.lk.acquire();
-                let was_cached = {
-                    let mut items = ch.items.lock().unwrap();
-                    let before = items.len();
-                    items.retain(|s| s.id != fd);
-                    items.len() < before
-                };
-                ch.lk.release();
-                if was_cached {
-                    self.disk.ops.fetch_add(1, Ordering::Relaxed);
-                }
-                if fd < 3 {
-                    return Ok(0);
-                }
+                let task = self.cur_task(0).ok_or("esrch")?;
+                self.close_fd(task.id(), fd)?;
                 Ok(0)
             }
             SYS_STAT | SYS_FSTAT => {
@@ -1025,4 +921,43 @@ impl Kernel {
             _ => Err("enosys"),
         }
     }
+}
+
+unsafe fn simulator_user_slice<'a>(addr: usize, len: usize) -> Result<&'a [u8], &'static str> {
+    if addr == 0 && len > 0 {
+        return Err("efault");
+    }
+    if !check_access(addr, len) {
+        return Err("efault");
+    }
+    Ok(unsafe { std::slice::from_raw_parts(addr as *const u8, len) })
+}
+
+unsafe fn simulator_user_slice_mut<'a>(
+    addr: usize,
+    len: usize,
+) -> Result<&'a mut [u8], &'static str> {
+    if addr == 0 && len > 0 {
+        return Err("efault");
+    }
+    if !check_access_rw(addr, len, true) {
+        return Err("efault");
+    }
+    Ok(unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, len) })
+}
+
+unsafe fn simulator_user_cstr(addr: usize, max_len: usize) -> Result<String, &'static str> {
+    if addr == 0 || max_len == 0 || !check_access(addr, 1) {
+        return Err("efault");
+    }
+
+    // AGENT: This is only for the user-space simulator. A real kernel must not
+    // AGENT: dereference a user pointer directly; it should walk the current
+    // AGENT: task page table and use copy_from_user/copy_to_user semantics.
+    let cstr = unsafe { std::ffi::CStr::from_ptr(addr as *const std::ffi::c_char) };
+    let bytes = cstr.to_bytes();
+    if bytes.len() >= max_len {
+        return Err("enametoolong");
+    }
+    cstr.to_str().map(|s| s.to_string()).map_err(|_| "einval")
 }

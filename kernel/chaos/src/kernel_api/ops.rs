@@ -100,6 +100,85 @@ impl Kernel {
         Ok(resolved)
     }
 
+    pub fn open_file_for_task(
+        &self,
+        task_id: usize,
+        path: &str,
+        flags: usize,
+        _mode: usize,
+    ) -> Result<usize, &'static str> {
+        let task = self.tasks.find(task_id).ok_or("esrch")?;
+        let acc_mode = flags & O_ACCMODE;
+        let opt = match acc_mode {
+            O_RDONLY => FdOpt {
+                rd: true,
+                wr: false,
+                ap: false,
+                nb: false,
+            },
+            O_WRONLY => FdOpt {
+                rd: false,
+                wr: true,
+                ap: false,
+                nb: false,
+            },
+            O_RDWR => FdOpt {
+                rd: true,
+                wr: true,
+                ap: false,
+                nb: false,
+            },
+            _ => return Err("einval"),
+        };
+        let opt = FdOpt {
+            ap: (flags & O_APPEND) != 0,
+            nb: (flags & O_NONBLOCK) != 0,
+            ..opt
+        };
+        let create = (flags & O_CREAT) != 0;
+        let excl = (flags & O_EXCL) != 0;
+        let trunc = (flags & O_TRUNC) != 0;
+        let cloexec = (flags & O_CLOEXEC) != 0;
+
+        let meta_index = match self.swapfs.open(path) {
+            Ok(index) => {
+                if create && excl {
+                    return Err("eexist");
+                }
+                index
+            }
+            Err("enoent") if create => self.swapfs.create(path, 1)?,
+            Err(e) => return Err(e),
+        };
+        let fh = FHandle::new(path, self.swapfs.clone(), meta_index, opt, cloexec);
+        if trunc && opt.wr {
+            fh.set_len(0)?;
+        }
+        Ok(task.add_file(FLike::File(fh)))
+    }
+
+    pub fn read_fd(
+        &self,
+        task_id: usize,
+        fd: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, &'static str> {
+        let task = self.tasks.find(task_id).ok_or("esrch")?;
+        let fl = task.get_file(fd).ok_or("ebadf")?;
+        fl.read(buf)
+    }
+
+    pub fn write_fd(&self, task_id: usize, fd: usize, buf: &[u8]) -> Result<usize, &'static str> {
+        let task = self.tasks.find(task_id).ok_or("esrch")?;
+        let fl = task.get_file(fd).ok_or("ebadf")?;
+        fl.write(buf)
+    }
+
+    pub fn close_fd(&self, task_id: usize, fd: usize) -> Result<(), &'static str> {
+        let task = self.tasks.find(task_id).ok_or("esrch")?;
+        task.close_fd(fd)
+    }
+
     pub fn alloc_pages(&self, count: usize) -> Vec<usize> {
         let mut pages = Vec::with_capacity(count);
         let free_before = self.pool.free_count();

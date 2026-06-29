@@ -393,44 +393,56 @@ Kernel::new(nf)
 
 ### `kernel_api/syscall.rs`
 
-当前 `SYS_OPEN/SYS_READ/SYS_WRITE` 主要是 mock。
+当前 `SYS_OPEN/SYS_READ/SYS_WRITE/SYS_CLOSE` 已经接到 SwapFS-backed fd 路径。
 
-当前 `SYS_OPEN` 已经会创建 SwapFS-backed `FHandle`，但还没有从用户地址空间读取真实路径字符串；它临时把 `path_addr` 编成 `anon_<addr>` 作为 flat 文件名。下一步应该先做内核内部 fd API，再把真实 syscall 的用户内存路径读取接进去。
+用户态模拟版本没有真实页表，所以 syscall 层暂时把传入的 `path_addr/buf_addr`
+当成当前 Rust 进程里的真实指针（raw pointer）使用。
 
 ```text
 SYS_OPEN:
   1. 校验 path_addr。
-  2. 暂时用 anon_<path_addr> 作为路径名。
-  3. 不经过 `MountTable`，直接把 path normalize 成 SwapFS v1 支持的根目录文件名。
-  4. 调 Kernel.swapfs.open_or_create(name, true, initial_blocks) 得到 meta_index。
-  5. 创建 FHandle::new(path, fs, meta_index, opt, cloexec)。
-  6. 插入当前 Task.files，返回 fd。
+  2. 通过用户态模拟 raw pointer 读取 NUL 结尾路径字符串。
+  3. 不经过完整 `MountTable` 挂载语义，直接把路径交给 SwapFS v1。
+  4. 调 `Kernel::open_file_for_task(task_id, path, flags, mode)`。
+  5. 创建 `FHandle::new(path, fs, meta_index, opt, cloexec)`。
+  6. 插入当前 `Task.files`，返回 fd。
 
 SYS_READ:
   1. 找当前 task。
-  2. 通过 fd 找 FLike。
-  3. 临时测试路径可先不做真实 user buffer copy，而是增加内核内部 read API。
-  4. 最终应该调用 FLike::read。
+  2. 检查用户输出 buffer 地址。
+  3. 把 `buf_addr` 转成 `&mut [u8]`。
+  4. 调 `Kernel::read_fd`，直接写入这个用户态模拟 buffer。
 
 SYS_WRITE:
   1. 找当前 task。
-  2. 通过 fd 找 FLike。
-  3. 最终调用 FLike::write。
+  2. 检查用户输入 buffer 地址。
+  3. 把 `buf_addr` 转成 `&[u8]`。
+  4. 调 `Kernel::write_fd` 写入 `FLike`。
 
 SYS_CLOSE:
-  1. 从 Task.files 移除 fd。
-  2. 不需要删除文件数据。
+  1. 找当前 task。
+  2. 调 `Kernel::close_fd` 从 `Task.files` 移除 fd。
+  3. 不需要删除文件数据。
 ```
 
-由于当前内核还没有真实用户地址空间拷贝，建议第一阶段先实现内核内部 API：
+当前已经实现内核内部 API：
 
 ```rust
 Kernel::open_file_for_task(task_id, path, flags, mode) -> Result<usize, &'static str>
 Kernel::read_fd(task_id, fd, buf: &mut [u8]) -> Result<usize, &'static str>
 Kernel::write_fd(task_id, fd, buf: &[u8]) -> Result<usize, &'static str>
+Kernel::close_fd(task_id, fd) -> Result<(), &'static str>
 ```
 
-确认 SwapFS 行为后，再改 `dispatch_syscall`。
+syscall 层现在只负责参数转换和用户态模拟 raw pointer 转换，文件读写路径是：
+
+```text
+dispatch_syscall -> simulator raw pointer -> Kernel fd API -> Task.files -> FLike -> FHandle -> SwapFS -> Disk
+```
+
+这里的 raw pointer 访问只是用户态模拟内核里的演示替代物，不是真实页表。
+真实内核移植时应该把 `simulator_user_slice/simulator_user_slice_mut/simulator_user_cstr`
+换成页表权限检查和 `copy_from_user/copy_to_user`。
 
 ### `process/task.rs`
 
@@ -789,7 +801,9 @@ chaos-tests/tests/fs_refactor/fd.rs
 8. syscall/Kernel API：
    - `Kernel::open_file_for_task` 返回 fd。
    - `Kernel::write_fd/read_fd` 通过 fd 读写 SwapFS 文件。
-   - 后续再把 `SYS_OPEN/READ/WRITE` 接到这条路径。
+   - `Kernel::close_fd` 从对应 task 的 fd table 移除 fd。
+   - 覆盖 create/open、append、truncate、权限错误、close 后 ebadf。
+   - `SYS_OPEN/READ/WRITE/CLOSE` 通过用户态模拟 raw pointer 接到这条路径。
 
 9. Disk 块设备语义：
    - 新建 `Disk::new("d0", 8, 512)` 后，读取任意 block 返回全 0。
@@ -826,8 +840,8 @@ chaos-tests/tests/fs_refactor/fd.rs
 7. 改 `FHandle`，删除 `data: Arc<Mutex<Vec<u8>>>`，改成 `fs: Arc<SwapFs>` 和 `meta_index: usize`。
 8. 让 `FHandle::read_at/write_at/metadata_sz/set_len/fallocate` 直接调用 SwapFS。
 9. 改 `FLike::File`，让它只调用 `FHandle` 方法，不直接访问 `FHandle` 内部字段。
-10. 增加 `Kernel` 内部 fd API：`open_file_for_task/read_fd/write_fd`。
-11. 最后再改 `dispatch_syscall` 的 `SYS_OPEN/SYS_READ/SYS_WRITE`。
+10. 增加 `Kernel` 内部 fd API：`open_file_for_task/read_fd/write_fd/close_fd`。
+11. 改 `dispatch_syscall` 的 `SYS_OPEN/SYS_READ/SYS_WRITE/SYS_CLOSE`，通过用户态模拟 raw pointer 访问 buffer。
 
 ## 暂时不做
 
