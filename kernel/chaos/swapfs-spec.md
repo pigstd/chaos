@@ -79,11 +79,32 @@ pub struct SwapFsSuperBlockDisk {
 #[repr(C)]
 pub struct SwapFsMetaDisk {
     pub used: u8,
+    pub reserved0: [u8; 7],
     pub name: [u8; SWAPFS_NAME_LEN],
     pub start_block: u64,
     pub block_count: u64,
     pub size: u64,
+    pub reserved1: [u8; 32],
 }
+```
+
+`SwapFsMetaDisk` 固定为 128 bytes，不使用 89-byte 紧凑布局。原因是：
+
+```text
+512 / 128 = 4 metadata records per block
+```
+
+并且 `used` 后面留 7 bytes padding，让后面的字段按 8-byte 边界排列：
+
+```text
+offset 0    used: u8
+offset 1    reserved0: [u8; 7]
+offset 8    name: [u8; 64]
+offset 72   start_block: u64
+offset 80   block_count: u64
+offset 88   size: u64
+offset 96   reserved1: [u8; 32]
+offset 128  end
 ```
 
 字段含义：
