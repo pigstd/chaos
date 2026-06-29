@@ -26,7 +26,7 @@ impl Kernel {
             tty_buf: Mutex::new(VecDeque::new()),
             // human：请问这是人类吗？
             // 神了，我不知道 disk 的这个 lable 有啥用，好像根本没用，先放一个空的
-            disk: Disk::new(""),
+            disk: Disk::new("", 1024, 512),
         }
     }
     pub fn tick(&self, id: usize) {

@@ -1,47 +1,73 @@
 use chaos_tests::*;
 
 #[test]
-fn basic_block_read_success() {
-    let d = Disk::new("ok");
-    let mut buf = [0u8; 512];
-    let result = d.read_block(0, &mut buf);
-    assert!(result.is_ok());
-    assert!(buf.iter().all(|&b| b == 0xAA));
+fn basic_disk_starts_zeroed() {
+    let d = Disk::new("d0", 4, 512);
+    let mut buf = [0xFFu8; 512];
+
+    assert_eq!(d.block_size(), 512);
+    assert_eq!(d.block_count(), 4);
+    assert_eq!(d.read_block(0, &mut buf), Ok(()));
+    assert!(buf.iter().all(|&b| b == 0));
 }
 
 #[test]
-fn basic_block_read_single_retry() {
-    let d = Disk::failing("retry1", 1);
-    let mut buf = [0u8; 512];
-    let result = d.read_block_n(0, &mut buf, 100);
-    assert!(result.is_ok());
-    assert_eq!(d.total_ops(), 2);
+fn basic_disk_write_then_read_same_block() {
+    let d = Disk::new("d0", 8, 512);
+    let mut input = [0u8; 512];
+    for (idx, b) in input.iter_mut().enumerate() {
+        *b = (idx % 251) as u8;
+    }
+    let mut output = [0u8; 512];
+
+    assert_eq!(d.write_block(3, &input), Ok(()));
+    assert_eq!(d.read_block(3, &mut output), Ok(()));
+    assert_eq!(output, input);
 }
 
 #[test]
-fn basic_block_read_infinite_retry() {
-    let d = Disk::failing("inf", usize::MAX);
-    let mut buf = [0u8; 512];
-    let result = d.read_block_n(0, &mut buf, 10);
-    assert_eq!(result, Err("limit"));
-    assert_eq!(d.total_ops(), 10);
+fn basic_disk_blocks_are_isolated() {
+    let d = Disk::new("d0", 8, 512);
+    let block_three = [0x33u8; 512];
+    let mut block_two = [0xFFu8; 512];
+    let mut block_four = [0xFFu8; 512];
 
-    let d2 = Disk::failing("inf2", usize::MAX);
-    let finished = run_with_timeout(
-        move || {
-            let mut b = [0u8; 512];
-            let _ = d2.read_block(0, &mut b);
-        },
-        200,
-    );
-    assert!(!finished);
+    assert_eq!(d.write_block(3, &block_three), Ok(()));
+    assert_eq!(d.read_block(2, &mut block_two), Ok(()));
+    assert_eq!(d.read_block(4, &mut block_four), Ok(()));
+    assert!(block_two.iter().all(|&b| b == 0));
+    assert!(block_four.iter().all(|&b| b == 0));
 }
 
-fn run_with_timeout<F: FnOnce() + Send + 'static>(f: F, ms: u64) -> bool {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        f();
-        let _ = tx.send(());
-    });
-    rx.recv_timeout(std::time::Duration::from_millis(ms)).is_ok()
+#[test]
+fn basic_disk_rejects_wrong_buffer_size() {
+    let d = Disk::new("d0", 8, 512);
+    let mut short_read = [0u8; 511];
+    let short_write = [0u8; 511];
+
+    assert_eq!(d.read_block(0, &mut short_read), Err("einval"));
+    assert_eq!(d.write_block(0, &short_write), Err("einval"));
+}
+
+#[test]
+fn basic_disk_rejects_out_of_range_block() {
+    let d = Disk::new("d0", 2, 512);
+    let mut buf = [0u8; 512];
+
+    assert_eq!(d.read_block(2, &mut buf), Err("einval"));
+    assert_eq!(d.write_block(2, &buf), Err("einval"));
+}
+
+#[test]
+fn basic_disk_counts_operations() {
+    let d = Disk::new("d0", 2, 512);
+    let mut buf = [0u8; 512];
+
+    assert_eq!(d.total_ops(), 0);
+    let _ = d.read_block(0, &mut buf);
+    let _ = d.write_block(1, &buf);
+    let _ = d.flush();
+    assert_eq!(d.total_ops(), 3);
+    d.reset_ops();
+    assert_eq!(d.total_ops(), 0);
 }
