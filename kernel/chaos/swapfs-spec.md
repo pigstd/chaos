@@ -455,22 +455,24 @@ Kernel::write_fd(task_id, fd, buf: &[u8]) -> Result<usize, &'static str>
 pub struct SwapFs {
     disk: Arc<Disk>,
     sb: RwLock<SwapFsSuperBlock>,
-    metas: RwLock<Vec<SwapFsMeta>>,
     alloc: Mutex<SwapFsAlloc>,
-}
-
-pub struct SwapFsMeta {
-    used: bool,
-    name: String,
-    start_block: u64,
-    block_count: u64,
-    size: u64,
 }
 
 pub struct SwapFsAlloc {
     next_free_block: u64,
 }
 ```
+
+`SwapFsAlloc` 不是新的磁盘真相。它只是 `superblock.next_free_block` 的运行时副本，用来减少每次分配前都读 superblock 的麻烦。每次分配 data blocks 并推进 `next_free_block` 后，必须更新内存里的 `alloc.next_free_block`，并通过 `sync_super()` 把新的 `next_free_block` 写回 block 0。否则重新 mount 后会重复分配已经用过的 block。
+
+SwapFS v1 不在 `mount()` 时把完整 metadata table 加载成 `Vec<SwapFsMeta>`。metadata 的真实位置是磁盘上的 metadata blocks；运行时按 `metadata index` 读写对应 record：
+
+```text
+meta_block  = meta_start_block + index / SWAPFS_META_PER_BLOCK
+meta_offset = (index % SWAPFS_META_PER_BLOCK) * SWAPFS_META_DISK_SIZE
+```
+
+这样 `FHandle` 只需要保存 `meta_index`，后续要查 size/start_block 时通过 `SwapFs::read_meta(index)` 从磁盘读取。metadata cache 可以后续再加，不作为 v1 的必需结构。
 
 方法：
 
@@ -479,6 +481,11 @@ impl SwapFs {
     pub fn format(disk: Arc<Disk>, total_blocks: u64, max_files: usize) -> Result<Arc<Self>, &'static str>;
     pub fn mount(disk: Arc<Disk>) -> Result<Arc<Self>, &'static str>;
     pub fn mount_or_format(disk: Arc<Disk>, total_blocks: u64, max_files: usize) -> Result<Arc<Self>, &'static str>;
+    pub fn read_meta(&self, meta_index: usize) -> Result<SwapFsMetaDisk, &'static str>;
+    pub fn write_meta(&self, meta_index: usize, meta: &SwapFsMetaDisk) -> Result<(), &'static str>;
+    pub fn find_meta_by_name(&self, name: &str) -> Result<usize, &'static str>;
+    pub fn find_free_meta(&self) -> Result<usize, &'static str>;
+    pub fn alloc_blocks(&self, block_count: u64) -> Result<u64, &'static str>;
     pub fn open(&self, name: &str) -> Result<usize, &'static str>;
     pub fn create(&self, name: &str, initial_blocks: u64) -> Result<usize, &'static str>;
     pub fn open_or_create(&self, name: &str, create: bool, initial_blocks: u64) -> Result<usize, &'static str>;
@@ -505,7 +512,7 @@ ebadf    fd 或打开权限错误
 
 ## 挂载模型
 
-这里的“挂载”第一版只表示：从一个 `Disk` 上读取 superblock 和 metadata table，把它变成内存里的 `Arc<SwapFs>`。它不是完整的 Linux mount namespace，也没有多个挂载点、路径覆盖、bind mount 或 `/proc`、`/dev` 这类特殊文件系统。
+这里的“挂载”第一版只表示：从一个 `Disk` 上读取 superblock，把它变成内存里的 `Arc<SwapFs>`。metadata table 不会整体读入内存，后续通过 `read_meta(index)` 按需读取。它不是完整的 Linux mount namespace，也没有多个挂载点、路径覆盖、bind mount 或 `/proc`、`/dev` 这类特殊文件系统。
 
 当前代码已有 `MountTable` / `Kernel.mnt`，但 SwapFS v1 暂时不接它。`MountTable` 现在只是路径前缀到字符串 target 的重写表，例如把 `/mnt/a` 解析成 `dev0:/a`；它还没有把 `dev0` 映射到真实 `Disk`、`SwapFs` 或 VFS 对象。为了先跑通真实文件读写，v1 的 `open/read/write` 主线不要经过 `MountTable`。
 
@@ -559,7 +566,7 @@ SwapFs::mount(disk)
   非破坏性加载已有文件系统。
   读取 block 0。
   校验 magic/version/block_size/total_blocks。
-  根据 superblock 读取 metadata table。
+  不加载完整 metadata table。
   恢复 alloc.next_free_block。
   返回 SwapFs。
 
@@ -575,13 +582,48 @@ SwapFs::mount_or_format(disk, total_blocks, max_files)
 
 ## 分配与删除策略
 
-第一版采用顺序分配：
+第一版分两类分配：
+
+```text
+metadata slot 分配：
+  扫描 metadata table。
+  找到第一个 used == 0 的 record。
+  把新文件 metadata 写入这个 slot。
+
+data block 分配：
+  使用 superblock.next_free_block / SwapFsAlloc.next_free_block 顺序分配。
+  删除文件后暂时不回收 data blocks。
+```
+
+metadata slot 查找：
+
+```text
+find_meta_by_name(name):
+  for index in 0..max_files:
+    meta = read_meta(index)
+    if meta.used && meta.name == name:
+      return index
+  return enoent
+
+find_free_meta():
+  for index in 0..max_files:
+    meta = read_meta(index)
+    if !meta.used:
+      return index
+  return enospc
+```
+
+创建文件第一版流程：
 
 ```text
 create:
-  start_block = next_free_block
-  block_count = initial_blocks
-  next_free_block += block_count
+  1. normalize/validate name。
+  2. find_meta_by_name(name)，如果已存在则按 flags 返回已有 index 或 eexist。
+  3. find_free_meta() 得到 metadata index。
+  4. start_block = alloc_blocks(initial_blocks)。
+  5. block_count = initial_blocks。
+  6. write_meta(index, new_meta)。
+  7. alloc_blocks 内部已经 sync_super() 写回新的 next_free_block。
 ```
 
 删除：
@@ -589,9 +631,38 @@ create:
 ```text
 unlink:
   metadata.used = false
+  write_meta(index, unused_meta)
   不回收 data blocks
   next_free_block 不回退
 ```
+
+这意味着 v1 中 metadata slot 可以复用，但 data blocks 暂时不会复用。后续加入 bitmap 后，再同时管理 metadata bitmap 和 data block bitmap。
+
+真实文件系统通常会维护 free-space metadata，例如：
+
+```text
+inode/meta bitmap   管 metadata slot 是否空闲
+block bitmap        管 data block 是否空闲
+free list/tree      管空闲区间
+```
+
+SwapFS v1 暂时不做 bitmap，是为了先跑通：
+
+```text
+create -> write -> read -> remount -> read
+```
+
+后续可以升级为：
+
+```text
+block 0        superblock
+block 1        metadata bitmap
+block 2        data block bitmap
+block 3..M     metadata table
+block data...  file data
+```
+
+如果仍保持 `start_block + block_count` 的连续文件模型，bitmap 分配时需要找连续空闲区间；如果允许非连续 blocks，则 metadata 需要升级为 extent list 或 block list。
 
 扩容：
 
