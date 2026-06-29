@@ -128,6 +128,16 @@ pub mod swapfs;
 pub use swapfs::*;
 ```
 
+同时新增一个很小的终端对象模块：
+
+```text
+fs/tty.rs
+```
+
+`tty.rs` 不属于 SwapFS。它只负责 stdin/stdout/stderr 这类终端 fd，让标准 fd 不再伪装成普通 `FHandle` 文件。
+
+`TTY` 是 Unix 里的传统名字，来自 teletype。历史上终端设备就是电传打字机；现在在内核语境里通常泛指 terminal/console 这类字符设备。所以这里叫 `TtyHandle`，意思是“终端/控制台句柄”，不是磁盘文件句柄。
+
 ## 需要修改的现有模块
 
 ### `fs/disk.rs`
@@ -171,6 +181,52 @@ pub struct Disk {
 
 旧的磁盘 mock 行为不再保留。新的正确语义是：写入某个 block 后，再读同一个 block 必须读回同样的数据。
 
+### `fs/tty.rs`
+
+在改 `FHandle` 之前，先把标准输入输出从普通文件里拆出来：
+
+```rust
+pub enum TtyKind {
+    Stdin,
+    Stdout,
+    Stderr,
+}
+
+#[derive(Clone)]
+pub struct TtyHandle {
+    pub kind: TtyKind,
+    pub(crate) desc: Arc<RwLock<FdState>>,
+    pub cloexec: bool,
+}
+```
+
+第一版行为：
+
+```text
+stdin.read      -> 暂时返回 Ok(0) 表示 EOF，后续再接键盘/console input
+stdin.write     -> Err("ebadf")
+stdout.read     -> Err("ebadf")
+stdout.write    -> 写到当前模拟环境的 console sink，或者第一版只记录/丢弃并返回 buf.len()
+stderr.read     -> Err("ebadf")
+stderr.write    -> 同 stdout
+poll_status     -> stdin 按无输入处理；stdout/stderr 永远 writable
+```
+
+如果当前用户态模拟内核暂时没有 console sink，`stdout/stderr.write` 可以先返回 `Ok(buf.len())`，但要在注释里说明这是占位行为。这样 syscall 和 fd 层可以先跑通，后面接真实串口、SBI console 或宿主输出时不用再动 `FHandle`。
+
+`FLike` 需要新增：
+
+```rust
+pub enum FLike {
+    File(FHandle),
+    Tty(TtyHandle),
+    Pipe(PipeNode),
+    Ep(EpInst),
+}
+```
+
+`FLike::{read,write,poll,io_ctl,dup}` 里新增 `Tty` 分支。重点是：`TtyHandle` 和 `FHandle` 同属于 fd table 里的 file-like object，但它们不是同一种底层对象。
+
 ### `fs/fd.rs`
 
 当前 `FHandle` 保存：
@@ -182,32 +238,99 @@ desc: Arc<RwLock<FdState>>
 cloexec: bool
 ```
 
-SwapFS 接入后，`FHandle` 不应该再只表示内存文件。建议第一版改成枚举 backing：
+SwapFS 接入后，`FHandle` 应该直接变成 SwapFS 普通文件句柄，不再保留 memory-backed 普通文件设计。第一版目标结构：
 
 ```rust
-pub enum FileBacking {
-    Memory(Arc<Mutex<Vec<u8>>>),
-    Swap(Arc<SwapFs>, usize), // usize 是 metadata index
-}
-
 pub struct FHandle {
     pub path: String,
-    pub backing: FileBacking,
+    pub fs: Arc<SwapFs>,
+    pub meta_index: usize,
     pub(crate) desc: Arc<RwLock<FdState>>,
     pub cloexec: bool,
 }
 ```
 
-这样可以保留旧内存文件行为，同时逐步把 `SYS_OPEN` 接到 SwapFS。
-
-`FHandle::read_at/write_at/metadata_sz/set_len/fallocate` 需要改为按 `backing` 分发：
+含义：
 
 ```text
-Memory -> 当前 Vec<u8> 逻辑
-Swap   -> SwapFs::read_at/write_at/metadata_len/set_len
+path       = 打开时使用的路径标签
+fs         = 所属 SwapFS 实例
+meta_index = 指向 SwapFS metadata table 的 index
+desc       = open-file state，保存 offset 和 open flags
+cloexec    = exec 时是否关闭
 ```
 
-`inode_ref()` 当前返回 `Arc<Mutex<Vec<u8>>>`，接入 SwapFS 后语义不再成立。第一版可以先保留但只支持 `Memory`，遇到 `Swap` 返回一个错误更合理；如果不想改签名，先不要在 SwapFS 路径调用它。
+`FHandle::read_at/write_at/metadata_sz/set_len/fallocate` 需要改为调用 SwapFS：
+
+```text
+read_at      -> self.fs.read_at(self.meta_index, off, buf)
+write_at     -> self.fs.write_at(self.meta_index, off, buf)
+metadata_sz  -> self.fs.metadata_len(self.meta_index)
+set_len      -> self.fs.set_len(self.meta_index, len)
+fallocate    -> self.fs.ensure_capacity(self.meta_index, offset + len)
+```
+
+`FHandle::new` 应该变成创建 SwapFS 句柄的构造函数，例如：
+
+```rust
+pub fn new(path: &str, fs: Arc<SwapFs>, meta_index: usize, opt: FdOpt, cloexec: bool) -> Self;
+```
+
+`FHandle::with_data`、`data: Arc<Mutex<Vec<u8>>>`、`inode_ref()` 这类内存文件接口应删除或迁移到测试辅助代码，不再作为普通文件系统路径的一部分。
+
+`FHandle` 第一阶段先只完成普通文件读写必须依赖的基础方法：
+
+| 方法 | v1 要求 |
+| --- | --- |
+| `new` | 保存 `path/fs/meta_index/desc/cloexec` |
+| `dup` | 共享同一个 `desc`，所以共享 offset；但允许新的 `cloexec` |
+| `read` | 检查读权限，按 `desc.off` 调 `read_at`，成功后推进 offset |
+| `read_at` | 调 `SwapFs::read_at(meta_index, off, buf)` |
+| `write` | 检查写权限；append 模式用文件当前 size 作为 offset；成功后推进 offset |
+| `write_at` | 调 `SwapFs::write_at(meta_index, off, buf)` |
+| `seek` | 只修改 `desc.off`；`End` 需要读取 SwapFS metadata size |
+| `metadata_sz` | 返回 SwapFS metadata size |
+| `set_len` | 调 `SwapFs::set_len`，用于 open truncate 和后续 truncate syscall |
+
+其他方法第一版可以先 stub，但必须明确语义，不要继续访问旧的 `data` 字段：
+
+| 方法 | v1 处理 |
+| --- | --- |
+| `sync_all/sync_data` | 可以先调用 `SwapFs::sync_meta` 和 `Disk::flush`，或者保守返回 `Ok(())` 并注释为 stub |
+| `lookup/read_entry` | SwapFS v1 没有目录，先返回 `Err("enosys")` 或保留只用于旧测试的 stub |
+| `poll_status` | 普通文件按 open flags 认为 always-ready，error 固定 false |
+| `io_ctl` | 普通文件返回 `Err("enotty")` 更合理；tty/device 后续自己实现 ioctl |
+| `mmap` | 返回 `Err("enosys")`，等 VM/page cache 后再做 |
+| `inode_ref` | 删除；SwapFS v1 没有 inode object 可返回 |
+| `advise_readahead` | 返回 `Ok(())` 或 `Err("enosys")`，不做真实预读 |
+| `fallocate` | 如果 `SwapFs::ensure_capacity` 已实现就接入；否则先返回 `Err("enosys")` |
+| `splice_to` | 可以用 `read` + `dst.write` 实现；不直接访问任何内部 backing |
+
+迁移时需要逐个处理当前依赖 `data` 的方法：
+
+| 方法 | 当前行为 | SwapFS 后行为 |
+| --- | --- | --- |
+| `dup` | clone `data` 和 `desc` | clone `fs`、`meta_index` 和 `desc` |
+| `read` | 用 `desc.off` 调 `read_at` | 保持 offset 逻辑，底层 `read_at` 走 SwapFS |
+| `write` | append 时用 `data.len()` | append 时用 `metadata_sz()` 或 `SwapFs::metadata_len` |
+| `seek(End)` | 用 `data.len()` | 用 SwapFS metadata size |
+| `set_len` | resize `Vec<u8>` | 调 `SwapFs::set_len`，必要时扩容分配块 |
+| `metadata_sz` | 返回 `Vec<u8>.len()` | 返回 metadata 里的 `size` |
+| `poll_status` | 检查 `data` 推断 error | 普通文件第一版可按 open flags 返回 ready，error 固定 false |
+| `sync_all/sync_data` | 空实现 | 至少调用 `SwapFs::sync_meta` 和 `Disk::flush` |
+| `fallocate` | resize `Vec<u8>` | 调 `SwapFs::ensure_capacity` |
+| `splice_to` | 直接从 `data` 复制 | 通过 `read` + `dst.write` 做，不直接看内部字段 |
+
+`lookup`、`read_entry` 暂时不应该继续挂在普通文件 `FHandle` 上实现目录语义。SwapFS v1 没有目录，可以先保留为 stub；后续有目录时应该挪到目录文件或 VFS/inode 层。
+
+`/dev/tty` 这类对象不是 SwapFS 普通文件。当前代码暂时把它建成 `FLike::File(FHandle)`，接入 SwapFS 时需要改掉。第一版可以选择：
+
+```text
+方案 A: 新增 FLike::Tty，占位实现 stdin/stdout/stderr。
+方案 B: 暂时不在 new_user_task() 中自动创建 /dev/tty fd，相关测试需要避开它。
+```
+
+推荐方案 A，因为它能保持 fd0/fd1/fd2 的概念，同时避免把设备文件塞进 SwapFS 普通文件。
 
 ### `fs/filelike.rs`
 
@@ -225,7 +348,7 @@ FLike::File(f) => f.read(buf)
 FLike::File(f) => f.write(buf)
 ```
 
-这样 `FLike` 不需要知道文件来自 Memory 还是 SwapFS。
+这样 `FLike` 不需要知道 `FHandle` 如何通过 SwapFS metadata index 定位磁盘块。
 
 ### `kernel_api/lifecycle.rs`
 
@@ -261,9 +384,10 @@ pub fn with_swapfs(nf: usize, blocks: usize) -> Self
 SYS_OPEN:
   1. 校验 path_addr。
   2. 第一版如果还没有用户内存字符串读取，可以临时用测试辅助路径，或新增内核内部 open API。
-  3. 调 SwapFs::open_or_create(name, flags) 得到 meta_index。
-  4. 创建 FHandle::swap(path, fs, meta_index, opt, cloexec)。
-  5. 插入当前 Task.files，返回 fd。
+  3. 不经过 `MountTable`，直接把 path normalize 成 SwapFS v1 支持的根目录文件名。
+  4. 调 SwapFs::open_or_create(name, flags) 得到 meta_index。
+  5. 创建 FHandle::new(path, fs, meta_index, opt, cloexec)。
+  6. 插入当前 Task.files，返回 fd。
 
 SYS_READ:
   1. 找当前 task。
@@ -300,6 +424,7 @@ Kernel::write_fd(task_id, fd, buf: &[u8]) -> Result<usize, &'static str>
 - `Task::add_file` 仍然只负责分配 fd。
 - `Task::dup_fd` 需要共享 `FHandle.desc`，这样 dup 后共享 offset。
 - `cloexec` 长期应该移到 fd entry，但 v1 可以继续放在 `FHandle`。
+- `new_user_task()` 当前用 `FHandle::new("/dev/tty", ...)` 创建标准输入输出。接入 SwapFS 后不能继续这样做，因为 `FHandle::new` 会需要真实 `SwapFs + meta_index`。这里应该迁移到 `FLike::Tty` 或暂时不初始化标准 fd。
 
 ## SwapFS 内部 API
 
@@ -331,6 +456,7 @@ pub struct SwapFsAlloc {
 ```rust
 impl SwapFs {
     pub fn format(disk: Arc<Disk>, total_blocks: u64, max_files: usize) -> Result<Arc<Self>, &'static str>;
+    pub fn mount(disk: Arc<Disk>) -> Result<Arc<Self>, &'static str>;
     pub fn mount_or_format(disk: Arc<Disk>, total_blocks: u64, max_files: usize) -> Result<Arc<Self>, &'static str>;
     pub fn open(&self, name: &str) -> Result<usize, &'static str>;
     pub fn create(&self, name: &str, initial_blocks: u64) -> Result<usize, &'static str>;
@@ -355,6 +481,76 @@ einval   文件名非法、offset 溢出、block 越界
 eio      磁盘读写失败
 ebadf    fd 或打开权限错误
 ```
+
+## 挂载模型
+
+这里的“挂载”第一版只表示：从一个 `Disk` 上读取 superblock 和 metadata table，把它变成内存里的 `Arc<SwapFs>`。它不是完整的 Linux mount namespace，也没有多个挂载点、路径覆盖、bind mount 或 `/proc`、`/dev` 这类特殊文件系统。
+
+当前代码已有 `MountTable` / `Kernel.mnt`，但 SwapFS v1 暂时不接它。`MountTable` 现在只是路径前缀到字符串 target 的重写表，例如把 `/mnt/a` 解析成 `dev0:/a`；它还没有把 `dev0` 映射到真实 `Disk`、`SwapFs` 或 VFS 对象。为了先跑通真实文件读写，v1 的 `open/read/write` 主线不要经过 `MountTable`。
+
+v1 的结构是：
+
+```text
+Kernel
+  disk: Arc<Disk>
+  swapfs: Arc<SwapFs>
+
+路径 "/a" 或 "a"
+  -> normalize 成 "a"
+  -> 在 Kernel.swapfs 里查 metadata
+```
+
+也就是说，第一版默认所有普通文件都属于根 SwapFS：
+
+```text
+/a
+/b
+/hello.txt
+```
+
+都直接走：
+
+```text
+Kernel.swapfs.open_or_create(...)
+```
+
+不处理：
+
+```text
+/mnt/disk1/a
+/dev/tty
+/proc/1/stat
+```
+
+这些路径需要 VFS/mount/devfs/procfs 之后再做。已有 `MountTable` 代码先保留，但不作为 SwapFS v1 的依赖。
+
+三个函数的职责应该分开：
+
+```text
+SwapFs::format(disk, total_blocks, max_files)
+  破坏性初始化文件系统。
+  写入 superblock。
+  清空 metadata table。
+  设置 next_free_block = data_start_block。
+  返回新建好的 SwapFs。
+
+SwapFs::mount(disk)
+  非破坏性加载已有文件系统。
+  读取 block 0。
+  校验 magic/version/block_size/total_blocks。
+  根据 superblock 读取 metadata table。
+  恢复 alloc.next_free_block。
+  返回 SwapFs。
+
+SwapFs::mount_or_format(disk, total_blocks, max_files)
+  测试和用户态演示用便利函数。
+  如果 block 0 是合法 SwapFS，就 mount。
+  如果不是合法 SwapFS，就 format。
+```
+
+长期看，真实内核一般不会无条件 `mount_or_format`，因为磁盘格式不认识时直接格式化会丢数据。第一版为了演示和测试可以这样做，但代码注释里应该说明它是开发期便利接口。
+
+`/dev/tty` 不通过这个挂载模型解决。它应该由 `FLike::Tty` 或未来的 devfs 提供，而不是写进 SwapFS 的 metadata table。
 
 ## 分配与删除策略
 
@@ -426,6 +622,7 @@ write 超过当前 block_count:
 ```text
 chaos-tests/tests/fs_refactor/main.rs
 chaos-tests/tests/fs_refactor/disk.rs
+chaos-tests/tests/fs_refactor/tty.rs
 chaos-tests/tests/fs_refactor/swapfs.rs
 chaos-tests/tests/fs_refactor/fd.rs
 ```
@@ -438,6 +635,8 @@ chaos-tests/tests/fs_refactor/fd.rs
    - `Disk::new(label, blocks, block_size)`
    - `SwapFs::format(...)`
    - superblock magic/version 正确。
+   - `SwapFs::mount(...)` 能从同一个 disk 重新加载已有 superblock 和 metadata。
+   - `SwapFs::mount_or_format(...)` 遇到合法 SwapFS 时必须 mount，不能重新 format。
 
 2. create/open：
    - 创建 `/a`。
@@ -479,18 +678,35 @@ chaos-tests/tests/fs_refactor/fd.rs
    - `out.len() != block_size` 或 `data.len() != block_size` 返回 `einval`。
    - 越界 block 返回 `einval`。
 
+10. Tty 拆分：
+   - `new_user_task()` 的 fd0/fd1/fd2 不再创建 `FHandle("/dev/tty")`。
+   - fd0 是 `FLike::Tty(Stdin)`。
+   - fd1 是 `FLike::Tty(Stdout)`。
+   - fd2 是 `FLike::Tty(Stderr)`。
+   - stdout/stderr write 返回写入长度。
+   - stdin write 返回 `ebadf`。
+
+11. FHandle SwapFS 化：
+   - `FHandle::new(path, fs, meta_index, opt, cloexec)` 创建的句柄读写 SwapFS。
+   - `FHandle::read/write` 推进 offset。
+   - `FHandle::dup` 共享 offset，但可设置新的 `cloexec`。
+   - `FLike::File` 只调用 `FHandle` 方法，不直接访问 `desc`、`data` 或 SwapFS 内部字段。
+   - 标准 fd 不能再通过 SwapFS 普通文件伪装 `/dev/tty`。
+
 ## 实现顺序
 
 建议按这个顺序落地：
 
 1. 重写 `Disk::new/read_block/write_block`，让 Disk 直接作为大数组块设备读写，并更新旧的磁盘测试。
-2. 增加 `fs/swapfs/layout.rs`，实现 superblock/meta record 的 encode/decode。
-3. 增加 `SwapFs::format/mount_or_format`，能读写 superblock 和 metadata table。
-4. 实现 `SwapFs::create/open/read_at/write_at/metadata_len`。
-5. 改 `FHandle`，增加 `FileBacking::Memory | Swap`，并让 `read_at/write_at/metadata_sz/set_len` 分发。
-6. 改 `FLike::File`，让它调用 `FHandle::read/write`，不要直接访问 `FHandle` 内部字段。
-7. 增加 `Kernel` 内部 fd API：`open_file_for_task/read_fd/write_fd`。
-8. 最后再改 `dispatch_syscall` 的 `SYS_OPEN/SYS_READ/SYS_WRITE`。
+2. 增加 `fs/tty.rs` 和 `FLike::Tty`，把 `new_user_task()` 的 fd0/fd1/fd2 从 `FHandle("/dev/tty")` 迁移到 `TtyHandle`。
+3. 增加 `fs/swapfs/layout.rs`，实现 superblock/meta record 的 encode/decode。
+4. 增加 `SwapFs::format/mount/mount_or_format`，能读写 superblock 和 metadata table。
+5. 实现 `SwapFs::create/open/read_at/write_at/metadata_len`。
+6. 改 `FHandle`，删除 `data: Arc<Mutex<Vec<u8>>>`，改成 `fs: Arc<SwapFs>` 和 `meta_index: usize`。
+7. 让 `FHandle::read_at/write_at/metadata_sz/set_len/fallocate` 直接调用 SwapFS。
+8. 改 `FLike::File`，让它只调用 `FHandle` 方法，不直接访问 `FHandle` 内部字段。
+9. 增加 `Kernel` 内部 fd API：`open_file_for_task/read_fd/write_fd`。
+10. 最后再改 `dispatch_syscall` 的 `SYS_OPEN/SYS_READ/SYS_WRITE`。
 
 ## 暂时不做
 
