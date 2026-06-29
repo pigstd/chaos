@@ -20,12 +20,12 @@ impl FdState {
     }
 }
 
+// pipe: 貌似是遗留产物，不需要，先删掉了
 #[derive(Clone)]
 pub struct FHandle {
     pub path: String,
     pub data: Arc<Mutex<Vec<u8>>>,
     pub(crate) desc: Arc<RwLock<FdState>>,
-    pub pipe: bool,
     pub cloexec: bool,
 }
 
@@ -33,12 +33,11 @@ pub struct FHandle {
 pub enum FSeek { Start(u64), End(i64), Cur(i64) }
 
 impl FHandle {
-    pub fn new(path: &str, opt: FdOpt, pipe: bool, cloexec: bool) -> Self {
+    pub fn new(path: &str, opt: FdOpt, cloexec: bool) -> Self {
         Self {
             path: path.to_string(),
             data: Arc::new(Mutex::new(Vec::new())),
             desc: FdState::create(opt),
-            pipe,
             cloexec,
         }
     }
@@ -47,7 +46,6 @@ impl FHandle {
             path: path.to_string(),
             data: Arc::new(Mutex::new(d)),
             desc: FdState::create(opt),
-            pipe: false,
             cloexec: false,
         }
     }
@@ -56,7 +54,6 @@ impl FHandle {
             path: self.path.clone(),
             data: self.data.clone(),
             desc: self.desc.clone(),
-            pipe: self.pipe,
             cloexec,
         }
     }

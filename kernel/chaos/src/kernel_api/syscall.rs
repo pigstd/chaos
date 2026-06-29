@@ -123,7 +123,7 @@ impl Kernel {
                     let opt = FdOpt { rd, wr, ap: _append, nb: _nonblock };
                     // human:
                     // 其实有点不懂。。anon 应该要改成路径名字，但是修编译先不管了
-                    let fh = FHandle::new("anon", opt, false, _cloexec);
+                    let fh = FHandle::new("anon", opt, _cloexec);
                     let fd = t.add_file(FLike::File(fh));
                     if _truncate && wr {
                         let _ = t.files.lock().unwrap().get(&fd).map(|fl| {

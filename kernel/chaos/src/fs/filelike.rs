@@ -44,7 +44,6 @@ impl FLike {
                     path: f.path.clone(),
                     data: f.data.clone(),
                     desc: f.desc.clone(),
-                    pipe: f.pipe,
                     cloexec,
                 };
                 let _sz = cloned.data.lock().unwrap().len();
