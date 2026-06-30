@@ -6,4 +6,5 @@ mod swapfs_format;
 mod swapfs_layout;
 mod swapfs_metadata;
 mod syscall_fd;
+mod syscall_e2e;
 mod tty;
