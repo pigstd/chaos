@@ -4,6 +4,7 @@ pub mod queue;
 pub mod sema;
 pub mod futex;
 pub mod wait;
+pub mod rwlock;
 
 pub use lock::*;
 pub use event::*;
