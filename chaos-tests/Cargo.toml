@@ -18,6 +18,10 @@ name = "fs-refactor"
 path = "tests/fs_refactor/main.rs"
 
 [[test]]
+name = "rwlock"
+path = "tests/rwlock/main.rs"
+
+[[test]]
 name = "advanced"
 path = "tests/advanced/main.rs"
 
