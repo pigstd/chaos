@@ -12,13 +12,11 @@ fn swapfs_create_allocates_metadata_slot_and_data_blocks() {
     assert_eq!(index, 0);
     assert!(meta.is_used());
     assert_eq!(meta.name_str(), Ok("alpha"));
-    assert_eq!(meta.start_block, 2);
+    assert_eq!(meta.start_block, 3);
     assert_eq!(meta.block_count, 1);
     assert_eq!(meta.size, 0);
-    assert_eq!(fs.next_free_block(), 3);
 
     let remounted = SwapFs::mount(disk).unwrap();
-    assert_eq!(remounted.next_free_block(), 3);
     assert_eq!(remounted.open("alpha"), Ok(0));
 }
 
@@ -43,11 +41,12 @@ fn swapfs_open_or_create_does_not_reallocate_existing_file() {
     let fs = SwapFs::format(disk, 32, 4).unwrap();
 
     let first = fs.create("alpha", 1).unwrap();
-    assert_eq!(fs.next_free_block(), 3);
     let second = fs.open_or_create("/alpha", true, 8).unwrap();
 
     assert_eq!(second, first);
-    assert_eq!(fs.next_free_block(), 3);
+    let meta = fs.read_meta(first).unwrap();
+    assert_eq!(meta.start_block, 3);
+    assert_eq!(meta.block_count, 1);
 }
 
 #[test]
@@ -57,7 +56,6 @@ fn swapfs_create_reuses_free_metadata_slot_but_not_old_blocks() {
 
     assert_eq!(fs.create("first", 1), Ok(0));
     assert_eq!(fs.create("second", 1), Ok(1));
-    assert_eq!(fs.next_free_block(), 4);
 
     fs.write_meta(0, &SwapFsMetaDisk::unused()).unwrap();
     assert_eq!(fs.find_free_meta(), Ok(0));
@@ -67,8 +65,7 @@ fn swapfs_create_reuses_free_metadata_slot_but_not_old_blocks() {
 
     assert_eq!(reused, 0);
     assert_eq!(meta.name_str(), Ok("third"));
-    assert_eq!(meta.start_block, 4);
-    assert_eq!(fs.next_free_block(), 5);
+    assert_eq!(meta.start_block, 5);
 }
 
 #[test]

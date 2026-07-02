@@ -17,7 +17,7 @@ pub struct Kernel {
 impl Kernel {
     pub fn new(nf: usize) -> Self {
         let disk = Arc::new(Disk::new("", 1024, SWAPFS_BLOCK_SIZE));
-        let swapfs = SwapFs::mount_or_format(disk.clone(), disk.block_count() as u64, 128)
+        let swapfs = SwapFs::mount_or_format(disk.clone(), disk.block_count(), 128)
             .expect("default SwapFS format failed");
         Self {
             tasks: TaskTable::new(),

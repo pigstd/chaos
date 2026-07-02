@@ -68,7 +68,7 @@ impl SwapFs {
         }
     }
 
-    fn meta_location(&self, meta_index: usize) -> Result<(usize, usize), &'static str> {
+    fn meta_location(&self, meta_index: usize) -> Result<(u64, usize), &'static str> {
         let sb = self.sb.read().unwrap();
         if meta_index >= sb.max_files as usize {
             return Err("einval");
@@ -82,7 +82,7 @@ impl SwapFs {
         if block_id >= sb.data_start_block {
             return Err("einval");
         }
-        Ok((block_id as usize, slot * SWAPFS_META_DISK_SIZE))
+        Ok((block_id, slot * SWAPFS_META_DISK_SIZE))
     }
 }
 

@@ -2,7 +2,7 @@ use chaos_tests::*;
 
 #[test]
 fn swapfs_superblock_round_trips_from_block_bytes() {
-    let sb = SwapFsSuperBlockDisk::new(128, 2, 3, 3, 16);
+    let sb = SwapFsSuperBlockDisk::new(128, 1, 2, 16);
     let mut block = [0xFFu8; SWAPFS_BLOCK_SIZE];
 
     assert_eq!(sb.encode_into(&mut block), Ok(()));
@@ -41,7 +41,7 @@ fn swapfs_meta_round_trips_fixed_name_bytes() {
 
 #[test]
 fn swapfs_layout_rejects_short_buffers() {
-    let sb = SwapFsSuperBlockDisk::new(128, 2, 3, 3, 16);
+    let sb = SwapFsSuperBlockDisk::new(128, 1, 2, 16);
     let mut short_sb = [0u8; SWAPFS_SUPER_BLOCK_DISK_SIZE - 1];
     assert_eq!(sb.encode_into(&mut short_sb), Err("einval"));
     assert_eq!(SwapFsSuperBlockDisk::decode_from(&short_sb), Err("einval"));

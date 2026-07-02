@@ -10,6 +10,7 @@ pub mod block_cache;
 pub mod mount;
 pub mod io;
 pub mod disk;
+pub mod block_device;
 
 pub use fd::*;
 pub use filelike::*;
@@ -23,3 +24,4 @@ pub use block_cache::*;
 pub use mount::*;
 pub use io::*;
 pub use disk::*;
+pub use block_device::*;

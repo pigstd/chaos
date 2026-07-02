@@ -42,7 +42,10 @@ rename
 block 0:
   superblock
 
-block 1..meta_block_count:
+block bitmap_start_block..bitmap_start_block + bitmap_block_count:
+  block bitmap
+
+block meta_start_block..meta_start_block + meta_block_count:
   metadata table
 
 block data_start_block..total_blocks:
@@ -69,6 +72,8 @@ pub struct SwapFsSuperBlockDisk {
     pub version: u32,
     pub block_size: u32,
     pub total_blocks: u64,
+    pub bitmap_start_block: u64,
+    pub bitmap_block_count: u64,
     pub meta_start_block: u64,
     pub meta_block_count: u64,
     pub data_start_block: u64,
@@ -114,7 +119,12 @@ offset 128  end
 - `start_block`: 文件数据起始 block。
 - `block_count`: 文件已经分配的连续 block 数量。
 - `size`: 文件真实长度，读操作不能超过它。
-- `next_free_block`: 顺序分配指针。第一版删除文件后不回收空间，所以它只递增。
+- `bitmap_start_block`: block bitmap 的起始 block。当前布局固定为 1。
+- `bitmap_block_count`: block bitmap 占用的 block 数量。一个 512-byte bitmap block 可以记录 4096 个 block。
+- `meta_start_block`: metadata table 的起始 block，等于 `bitmap_start_block + bitmap_block_count`。
+- `meta_block_count`: metadata table 占用的 block 数量。
+- `data_start_block`: 文件数据区起始 block，等于 `meta_start_block + meta_block_count`。
+- `next_free_block`: 临时顺序分配指针。bitmap 分配器接入前仍然使用；bitmap 接入后可以保留为 hint 或移除。
 
 ## 新增模块
 
@@ -482,6 +492,15 @@ meta_offset = (index % SWAPFS_META_PER_BLOCK) * SWAPFS_META_DISK_SIZE
 
 这样 `FHandle` 只需要保存 `meta_index`，后续要查 size/start_block 时通过 `SwapFs::read_meta(index)` 从磁盘读取。metadata cache 可以后续再加，不作为 v1 的必需结构。
 
+block bitmap 的真实位置也在磁盘上：
+
+```text
+bitmap_start_block = 1
+bitmap_block_count = ceil(total_blocks / (SWAPFS_BLOCK_SIZE * 8))
+```
+
+当前代码已经预留这个区域并把 metadata/data 起始位置后移，但 `alloc_blocks` 还没有读取 bitmap 分配。下一步新增 `bitmap.rs` 后，应让分配/释放只通过 bitmap 修改磁盘上的空闲状态。
+
 方法：
 
 ```rust
@@ -566,14 +585,17 @@ Kernel.swapfs.open_or_create(...)
 SwapFs::format(disk, total_blocks, max_files)
   破坏性初始化文件系统。
   写入 superblock。
-  清空 metadata table。
+  计算 bitmap_block_count。
+  清空 bitmap blocks 和 metadata table。
+  设置 meta_start_block = 1 + bitmap_block_count。
+  设置 data_start_block = meta_start_block + meta_block_count。
   设置 next_free_block = data_start_block。
   返回新建好的 SwapFs。
 
 SwapFs::mount(disk)
   非破坏性加载已有文件系统。
   读取 block 0。
-  校验 magic/version/block_size/total_blocks。
+  校验 magic/version/block_size/total_blocks/bitmap/meta/data 布局。
   不加载完整 metadata table。
   恢复 alloc.next_free_block。
   返回 SwapFs。
@@ -599,8 +621,9 @@ metadata slot 分配：
   把新文件 metadata 写入这个 slot。
 
 data block 分配：
-  使用 superblock.next_free_block / SwapFsAlloc.next_free_block 顺序分配。
+  当前仍使用 superblock.next_free_block / SwapFsAlloc.next_free_block 顺序分配。
   删除文件后暂时不回收 data blocks。
+  下一步 bitmap.rs 接入后改为扫描 block bitmap，找到连续空闲 blocks。
 ```
 
 metadata slot 查找：
@@ -644,7 +667,7 @@ unlink:
   next_free_block 不回退
 ```
 
-这意味着 v1 中 metadata slot 可以复用，但 data blocks 暂时不会复用。后续加入 bitmap 后，再同时管理 metadata bitmap 和 data block bitmap。
+这意味着当前版本中 metadata slot 可以复用，但 data blocks 暂时不会复用。磁盘布局已经预留 block bitmap 区域；后续加入 `bitmap.rs` 后，data blocks 应该可以释放并复用。
 
 ## 文件内容读写
 
@@ -680,7 +703,7 @@ block bitmap        管 data block 是否空闲
 free list/tree      管空闲区间
 ```
 
-SwapFS v1 暂时不做 bitmap，是为了先跑通：
+SwapFS 当前已经预留 block bitmap 的磁盘位置，但分配器还没有切换到 bitmap。这样做是为了先跑通：
 
 ```text
 create -> write -> read -> remount -> read
@@ -690,11 +713,12 @@ create -> write -> read -> remount -> read
 
 ```text
 block 0        superblock
-block 1        metadata bitmap
-block 2        data block bitmap
-block 3..M     metadata table
+block 1..B     block bitmap
+block B+1..M   metadata table
 block data...  file data
 ```
+
+第一版 bitmap 只记录 block 是否空闲，不单独引入 metadata bitmap。metadata slot 是否空闲仍由 `SwapFsMetaDisk.used` 表示。
 
 如果仍保持 `start_block + block_count` 的连续文件模型，bitmap 分配时需要找连续空闲区间；如果允许非连续 blocks，则 metadata 需要升级为 extent list 或 block list。
 
@@ -706,11 +730,11 @@ block data...  file data
 write 超过当前 block_count:
   1. 计算 required_blocks = ceil(desired_size / block_size)。
   2. 计算 grown_blocks = max(required_blocks, max(1, old_block_count * 2))。
-  3. 优先从 next_free_block 分配 grown_blocks，类似 Vec 扩容，减少频繁搬家。
+  3. 当前优先从 next_free_block 分配 grown_blocks，类似 Vec 扩容，减少频繁搬家。
   4. 如果 grown_blocks 因空间不足失败，并且 grown_blocks > required_blocks，则 fallback 到 required_blocks。
   5. 把旧文件内容复制到新位置。
   6. 更新 metadata.start_block/block_count/size。
-  7. 旧空间不回收。
+  7. 当前旧空间不回收；bitmap.rs 接入后应释放旧 block 区间。
 ```
 
 ## 路径规则

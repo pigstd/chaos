@@ -3,8 +3,9 @@ pub const SWAPFS_NAME_LEN: usize = 64;
 pub const SWAPFS_MAGIC: u32 = 0x5357_4150;
 pub const SWAPFS_VERSION: u32 = 1;
 
-pub const SWAPFS_SUPER_BLOCK_DISK_SIZE: usize = 56;
+pub const SWAPFS_SUPER_BLOCK_DISK_SIZE: usize = 64;
 pub const SWAPFS_META_DISK_SIZE: usize = 128;
+pub const SWAPFS_BITMAP_BITS_PER_BLOCK: u64 = (SWAPFS_BLOCK_SIZE as u64) * 8;
 pub const SWAPFS_META_PER_BLOCK: usize = SWAPFS_BLOCK_SIZE / SWAPFS_META_DISK_SIZE;
 pub const SWAPFS_META_NAME_OFFSET: usize = 8;
 pub const SWAPFS_META_START_BLOCK_OFFSET: usize = 72;
@@ -17,30 +18,34 @@ pub struct SwapFsSuperBlockDisk {
     pub version: u32,
     pub block_size: u32,
     pub total_blocks: u64,
+    pub bitmap_start_block: u64,
+    pub bitmap_block_count: u64,
     pub meta_start_block: u64,
     pub meta_block_count: u64,
     pub data_start_block: u64,
-    pub next_free_block: u64,
     pub max_files: u32,
 }
 
 impl SwapFsSuperBlockDisk {
     pub fn new(
         total_blocks: u64,
+        bitmap_block_count: u64,
         meta_block_count: u64,
-        data_start_block: u64,
-        next_free_block: u64,
         max_files: u32,
     ) -> Self {
+        let bitmap_start_block = 1;
+        let meta_start_block = bitmap_start_block + bitmap_block_count;
+        let data_start_block = meta_start_block + meta_block_count;
         Self {
             magic: SWAPFS_MAGIC,
             version: SWAPFS_VERSION,
             block_size: SWAPFS_BLOCK_SIZE as u32,
             total_blocks,
-            meta_start_block: 1,
+            bitmap_start_block,
+            bitmap_block_count,
+            meta_start_block,
             meta_block_count,
             data_start_block,
-            next_free_block,
             max_files,
         }
     }
@@ -54,11 +59,12 @@ impl SwapFsSuperBlockDisk {
         write_u32(out, 4, self.version);
         write_u32(out, 8, self.block_size);
         write_u64(out, 12, self.total_blocks);
-        write_u64(out, 20, self.meta_start_block);
-        write_u64(out, 28, self.meta_block_count);
-        write_u64(out, 36, self.data_start_block);
-        write_u64(out, 44, self.next_free_block);
-        write_u32(out, 52, self.max_files);
+        write_u64(out, 20, self.bitmap_start_block);
+        write_u64(out, 28, self.bitmap_block_count);
+        write_u64(out, 36, self.meta_start_block);
+        write_u64(out, 44, self.meta_block_count);
+        write_u64(out, 52, self.data_start_block);
+        write_u32(out, 60, self.max_files);
         Ok(())
     }
 
@@ -71,11 +77,12 @@ impl SwapFsSuperBlockDisk {
             version: read_u32(input, 4),
             block_size: read_u32(input, 8),
             total_blocks: read_u64(input, 12),
-            meta_start_block: read_u64(input, 20),
-            meta_block_count: read_u64(input, 28),
-            data_start_block: read_u64(input, 36),
-            next_free_block: read_u64(input, 44),
-            max_files: read_u32(input, 52),
+            bitmap_start_block: read_u64(input, 20),
+            bitmap_block_count: read_u64(input, 28),
+            meta_start_block: read_u64(input, 36),
+            meta_block_count: read_u64(input, 44),
+            data_start_block: read_u64(input, 52),
+            max_files: read_u32(input, 60),
         })
     }
 
@@ -89,7 +96,24 @@ impl SwapFsSuperBlockDisk {
         if self.block_size as usize != SWAPFS_BLOCK_SIZE {
             return Err("einval");
         }
-        if self.meta_start_block != 1 {
+        if self.bitmap_start_block != 1 {
+            return Err("einval");
+        }
+        if self.bitmap_block_count == 0 {
+            return Err("einval");
+        }
+        let bitmap_capacity = self
+            .bitmap_block_count
+            .checked_mul(SWAPFS_BITMAP_BITS_PER_BLOCK)
+            .ok_or("einval")?;
+        if bitmap_capacity < self.total_blocks {
+            return Err("einval");
+        }
+        let expected_meta_start = self
+            .bitmap_start_block
+            .checked_add(self.bitmap_block_count)
+            .ok_or("einval")?;
+        if self.meta_start_block != expected_meta_start {
             return Err("einval");
         }
         if self.meta_block_count == 0 {
@@ -102,17 +126,21 @@ impl SwapFsSuperBlockDisk {
         if self.data_start_block != expected_data_start {
             return Err("einval");
         }
-        if self.next_free_block < self.data_start_block {
-            return Err("einval");
-        }
-        if self.next_free_block > self.total_blocks {
-            return Err("einval");
-        }
         if self.max_files == 0 {
             return Err("einval");
         }
         Ok(())
     }
+}
+
+pub fn bitmap_block_count(total_blocks: u64) -> Result<u64, &'static str> {
+    if total_blocks == 0 {
+        return Err("einval");
+    }
+    let rounded = total_blocks
+        .checked_add(SWAPFS_BITMAP_BITS_PER_BLOCK - 1)
+        .ok_or("einval")?;
+    Ok(rounded / SWAPFS_BITMAP_BITS_PER_BLOCK)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,26 +1,23 @@
 use crate::prelude::*;
 use crate::*;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SwapFsAlloc {
-    pub next_free_block: u64,
-}
-
 pub struct SwapFs {
-    pub(crate) disk: Arc<Disk>,
+    pub(crate) disk: Arc<dyn BlockDevice>,
     pub(crate) sb: RwLock<SwapFsSuperBlockDisk>,
-    pub(crate) alloc: Mutex<SwapFsAlloc>,
+    pub(crate) alloc: Mutex<()>,
+    pub(crate) bitmap: Bitmap,
 }
 
 impl SwapFs {
     pub fn format(
-        disk: Arc<Disk>,
+        disk: Arc<dyn BlockDevice>,
         total_blocks: u64,
         max_files: usize,
     ) -> Result<Arc<Self>, &'static str> {
-        validate_format_args(&disk, total_blocks, max_files)?;
+        validate_format_args(disk.as_ref(), total_blocks, max_files)?;
+        let bitmap_block_count = bitmap_block_count(total_blocks)?;
         let meta_block_count = metadata_block_count(max_files)? as u64;
-        let data_start_block = 1 + meta_block_count;
+        let data_start_block = 1 + bitmap_block_count + meta_block_count;
         if data_start_block >= total_blocks {
             return Err("enospc");
         }
@@ -30,9 +27,8 @@ impl SwapFs {
 
         let sb = SwapFsSuperBlockDisk::new(
             total_blocks,
+            bitmap_block_count,
             meta_block_count,
-            data_start_block,
-            data_start_block,
             max_files as u32,
         );
         sb.validate()?;
@@ -42,21 +38,21 @@ impl SwapFs {
         disk.write_block(0, &block)?;
 
         let zero_block = [0u8; SWAPFS_BLOCK_SIZE];
-        for block_id in 1..data_start_block as usize {
+        for block_id in 1..data_start_block {
             disk.write_block(block_id, &zero_block)?;
         }
         disk.flush()?;
 
+        let bitmap = bitmap_from_superblock(&sb)?;
         Ok(Arc::new(Self {
             disk,
             sb: RwLock::new(sb),
-            alloc: Mutex::new(SwapFsAlloc {
-                next_free_block: data_start_block,
-            }),
+            alloc: Mutex::new(()),
+            bitmap,
         }))
     }
 
-    pub fn mount(disk: Arc<Disk>) -> Result<Arc<Self>, &'static str> {
+    pub fn mount(disk: Arc<dyn BlockDevice>) -> Result<Arc<Self>, &'static str> {
         if disk.block_size() != SWAPFS_BLOCK_SIZE {
             return Err("einval");
         }
@@ -65,18 +61,19 @@ impl SwapFs {
         disk.read_block(0, &mut block)?;
         let sb = SwapFsSuperBlockDisk::decode_from(&block)?;
         sb.validate()?;
-        validate_mounted_superblock(&disk, &sb)?;
+        validate_mounted_superblock(disk.as_ref(), &sb)?;
 
-        let next_free_block = sb.next_free_block;
+        let bitmap = bitmap_from_superblock(&sb)?;
         Ok(Arc::new(Self {
             disk,
             sb: RwLock::new(sb),
-            alloc: Mutex::new(SwapFsAlloc { next_free_block }),
+            alloc: Mutex::new(()),
+            bitmap,
         }))
     }
 
     pub fn mount_or_format(
-        disk: Arc<Disk>,
+        disk: Arc<dyn BlockDevice>,
         total_blocks: u64,
         max_files: usize,
     ) -> Result<Arc<Self>, &'static str> {
@@ -94,48 +91,24 @@ impl SwapFs {
         self.sb.read().unwrap().max_files as usize
     }
 
-    pub fn next_free_block(&self) -> u64 {
-        self.alloc.lock().unwrap().next_free_block
-    }
-
     pub fn alloc_blocks(&self, block_count: u64) -> Result<u64, &'static str> {
         if block_count == 0 {
-            return Ok(self.next_free_block());
+            return Ok(0);
         }
-        let total_blocks = self.sb.read().unwrap().total_blocks;
-        let start_block = {
-            let mut alloc = self.alloc.lock().unwrap();
-            let start = alloc.next_free_block;
-            let end = start.checked_add(block_count).ok_or("einval")?;
-            if end > total_blocks {
-                return Err("enospc");
-            }
-            alloc.next_free_block = end;
-            start
-        };
-        self.sync_super()?;
-        Ok(start_block)
-    }
-
-    pub fn sync_super(&self) -> Result<(), &'static str> {
-        let mut sb = self.sb.write().unwrap();
-        sb.next_free_block = self.alloc.lock().unwrap().next_free_block;
-        sb.validate()?;
-        let mut block = [0u8; SWAPFS_BLOCK_SIZE];
-        sb.encode_into(&mut block)?;
-        self.disk.write_block(0, &block)
+        let _alloc = self.alloc.lock().unwrap();
+        self.bitmap.alloc_blocks(block_count, self.disk.as_ref())
     }
 }
 
 fn validate_format_args(
-    disk: &Disk,
+    disk: &dyn BlockDevice,
     total_blocks: u64,
     max_files: usize,
 ) -> Result<(), &'static str> {
     if disk.block_size() != SWAPFS_BLOCK_SIZE {
         return Err("einval");
     }
-    if total_blocks != disk.block_count() as u64 {
+    if total_blocks != disk.block_count() {
         return Err("einval");
     }
     if total_blocks == 0 {
@@ -147,11 +120,21 @@ fn validate_format_args(
     Ok(())
 }
 
-fn validate_mounted_superblock(disk: &Disk, sb: &SwapFsSuperBlockDisk) -> Result<(), &'static str> {
-    if sb.total_blocks != disk.block_count() as u64 {
+fn validate_mounted_superblock(
+    disk: &dyn BlockDevice,
+    sb: &SwapFsSuperBlockDisk,
+) -> Result<(), &'static str> {
+    if sb.total_blocks != disk.block_count() {
         return Err("einval");
     }
     let max_files = sb.max_files as usize;
+    let bitmap_capacity = sb
+        .bitmap_block_count
+        .checked_mul(SWAPFS_BITMAP_BITS_PER_BLOCK)
+        .ok_or("einval")?;
+    if bitmap_capacity < sb.total_blocks {
+        return Err("einval");
+    }
     let meta_capacity = sb
         .meta_block_count
         .checked_mul(SWAPFS_META_PER_BLOCK as u64)
@@ -163,6 +146,16 @@ fn validate_mounted_superblock(disk: &Disk, sb: &SwapFsSuperBlockDisk) -> Result
         return Err("einval");
     }
     Ok(())
+}
+
+fn bitmap_from_superblock(sb: &SwapFsSuperBlockDisk) -> Result<Bitmap, &'static str> {
+    let can_alloc_end = sb.total_blocks.checked_sub(1).ok_or("einval")?;
+    Ok(Bitmap::new(
+        sb.bitmap_start_block,
+        sb.bitmap_block_count,
+        sb.data_start_block,
+        can_alloc_end,
+    ))
 }
 
 fn metadata_block_count(max_files: usize) -> Result<usize, &'static str> {

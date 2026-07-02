@@ -107,28 +107,56 @@ impl SwapFs {
         let old_size = meta_size_usize(meta)?;
         let required_block_count = blocks_for_len(desired_size)?;
         let mut new_block_count = growth_block_count(meta.block_count, required_block_count)?;
-        let new_start_block = match self.alloc_blocks(new_block_count) {
-            Ok(start_block) => start_block,
-            Err("enospc") if new_block_count != required_block_count => {
-                new_block_count = required_block_count;
-                self.alloc_blocks(new_block_count)?
-            }
-            Err(e) => return Err(e),
-        };
-        self.zero_blocks(new_start_block, new_block_count)?;
-        if old_size > 0 {
-            self.copy_between_blocks(
-                meta.start_block,
-                meta.block_count,
-                new_start_block,
-                new_block_count,
-                old_size,
-            )?;
+
+        // 优先尝试在原来的后面扩展
+        if self.bitmap.is_free(meta.start_block + meta.block_count, meta.start_block + new_block_count - 1, self.disk.as_ref())? {
+            self.bitmap.set_use(meta.start_block + meta.block_count, meta.start_block + new_block_count - 1, self.disk.as_ref())?;
+            meta.block_count = new_block_count;
+            return Ok(());
         }
 
-        meta.start_block = new_start_block;
+        let old_start_block = meta.start_block;
+        let old_block_count = meta.block_count;
+
+        match self.bitmap.alloc_blocks(new_block_count, self.disk.as_ref()) {
+            Ok(new_start_block) => {
+                self.copy_between_blocks(
+                    meta.start_block,
+                    meta.block_count,
+                    new_start_block,
+                    new_block_count,
+                    old_size,
+                )?;
+                meta.start_block = new_start_block;
+            }
+            // 如果 new_block_count 太大，可能会导致分配失败，这时尝试使用 required_block_count 重新分配
+            Err(_) => {
+                new_block_count = required_block_count;
+                match self.bitmap.alloc_blocks(new_block_count, self.disk.as_ref()) {
+                    Ok(new_start_block) => {
+                        self.copy_between_blocks(
+                            meta.start_block,
+                            meta.block_count,
+                            new_start_block,
+                            new_block_count,
+                            old_size,
+                        )?;
+                        meta.start_block = new_start_block;
+                    }
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
+            }
+        }
         meta.block_count = new_block_count;
-        Ok(())
+        
+        if old_block_count > 0 {
+            self.bitmap.set_free(old_start_block, old_start_block + old_block_count - 1, self.disk.as_ref())?;
+            self.zero_blocks(old_start_block, old_block_count)?;
+        }
+
+        return Ok(());
     }
 
     fn copy_between_blocks(
@@ -179,7 +207,7 @@ impl SwapFs {
                 .ok_or("einval")?;
             let mut block = [0u8; SWAPFS_BLOCK_SIZE];
             self.disk
-                .read_block(block_id_to_usize(block_id)?, &mut block)?;
+                .read_block(block_id, &mut block)?;
             out[copied..copied + chunk_len]
                 .copy_from_slice(&block[within_block..within_block + chunk_len]);
             copied += chunk_len;
@@ -206,11 +234,11 @@ impl SwapFs {
                 .ok_or("einval")?;
             let mut block = [0u8; SWAPFS_BLOCK_SIZE];
             self.disk
-                .read_block(block_id_to_usize(block_id)?, &mut block)?;
+                .read_block(block_id, &mut block)?;
             block[within_block..within_block + chunk_len]
                 .copy_from_slice(&input[copied..copied + chunk_len]);
             self.disk
-                .write_block(block_id_to_usize(block_id)?, &block)?;
+                .write_block(block_id, &block)?;
             copied += chunk_len;
         }
         Ok(())
@@ -220,7 +248,7 @@ impl SwapFs {
         let zero = [0u8; SWAPFS_BLOCK_SIZE];
         for rel in 0..block_count {
             let block_id = start_block.checked_add(rel).ok_or("einval")?;
-            self.disk.write_block(block_id_to_usize(block_id)?, &zero)?;
+            self.disk.write_block(block_id, &zero)?;
         }
         Ok(())
     }
@@ -287,11 +315,4 @@ fn validate_byte_range(block_count: u64, off: usize, len: usize) -> Result<(), &
         return Err("einval");
     }
     Ok(())
-}
-
-fn block_id_to_usize(block_id: u64) -> Result<usize, &'static str> {
-    if block_id > usize::MAX as u64 {
-        return Err("einval");
-    }
-    Ok(block_id as usize)
 }
