@@ -2,7 +2,7 @@
 
 ## 目标
 
-SwapFS v1 是 `kernel/chaos` 的第一版真实文件系统实验。它不追求完整 VFS，也不实现 inode tree、目录树、权限、日志或复杂块分配。目标是把当前 `FHandle -> Vec<u8>` 的内存文件，替换成一个能通过磁盘块寻址读写的简化文件系统。
+SwapFS v1 是 `kernel/chaos` 的第一版真实文件系统实验。它不追求完整 VFS，也不实现 inode tree、目录树、权限、日志或复杂块分配。目标是把原来的 `FHandle -> Vec<u8>` 内存文件模型，替换成一个能通过磁盘块寻址读写的简化文件系统。
 
 核心模型：
 
@@ -12,7 +12,7 @@ fd table
       -> SwapFs open file state
           -> metadata index
               -> metadata table record
-                  -> continuous data blocks on Disk
+                  -> continuous data blocks on BlockDevice
 ```
 
 第一版只支持 flat namespace：
@@ -77,7 +77,6 @@ pub struct SwapFsSuperBlockDisk {
     pub meta_start_block: u64,
     pub meta_block_count: u64,
     pub data_start_block: u64,
-    pub next_free_block: u64,
     pub max_files: u32,
 }
 
@@ -91,6 +90,22 @@ pub struct SwapFsMetaDisk {
     pub size: u64,
     pub reserved1: [u8; 32],
 }
+```
+
+`SwapFsSuperBlockDisk` 当前固定为 64 bytes：
+
+```text
+offset 0    magic: u32
+offset 4    version: u32
+offset 8    block_size: u32
+offset 12   total_blocks: u64
+offset 20   bitmap_start_block: u64
+offset 28   bitmap_block_count: u64
+offset 36   meta_start_block: u64
+offset 44   meta_block_count: u64
+offset 52   data_start_block: u64
+offset 60   max_files: u32
+offset 64   end
 ```
 
 `SwapFsMetaDisk` 固定为 128 bytes，不使用 89-byte 紧凑布局。原因是：
@@ -124,7 +139,7 @@ offset 128  end
 - `meta_start_block`: metadata table 的起始 block，等于 `bitmap_start_block + bitmap_block_count`。
 - `meta_block_count`: metadata table 占用的 block 数量。
 - `data_start_block`: 文件数据区起始 block，等于 `meta_start_block + meta_block_count`。
-- `next_free_block`: 临时顺序分配指针。bitmap 分配器接入前仍然使用；bitmap 接入后可以保留为 hint 或移除。
+- `max_files`: metadata table 允许容纳的最大文件数量。
 
 ## 新增模块
 
@@ -140,6 +155,7 @@ kernel/chaos/src/fs/swapfs/
 fs/swapfs/mod.rs
 fs/swapfs/layout.rs
 fs/swapfs/fs.rs
+fs/swapfs/bitmap.rs
 fs/swapfs/metadata.rs
 fs/swapfs/data.rs
 ```
@@ -149,12 +165,13 @@ fs/swapfs/data.rs
 | 模块 | 职责 |
 | --- | --- |
 | `layout.rs` | 定义磁盘格式常量、superblock、metadata record，以及 encode/decode 辅助函数。 |
-| `fs.rs` | 定义 `SwapFs` 和 `SwapFsAlloc`，负责 format/mount、superblock 同步、顺序 data block 分配。 |
+| `fs.rs` | 定义 `SwapFs`，负责 format/mount、superblock 校验、bitmap 初始化和分配并发保护。 |
+| `bitmap.rs` | 负责从磁盘 bitmap block 读写 bit，扫描连续空闲 data blocks，并标记 alloc/free。 |
 | `metadata.rs` | 负责按 metadata index 定位/读写 record，以及文件名查找、metadata slot 分配、create/open。 |
 | `data.rs` | 负责按 metadata index 执行 read_at/write_at/set_len，以及跨 block 读写、扩容搬家、补零。 |
 | `mod.rs` | 声明 SwapFS 子模块，并对外 re-export `SwapFs` 和 layout 常量。 |
 
-`fs/mod.rs` 需要新增：
+`fs/mod.rs` 当前已经导出：
 
 ```rust
 pub mod swapfs;
@@ -175,17 +192,29 @@ fs/tty.rs
 
 ### `fs/disk.rs`
 
-`Disk` 应该直接改成真正的块设备抽象。第一版不用关心真实硬件驱动，内部先用一个数组伪装磁盘；未来替换成真实磁盘驱动时，保持 `read_block/write_block` 语义不变即可。
+`Disk` 当前是用户态模拟用的内存块设备：内部用一个数组伪装磁盘。SwapFS 不直接依赖具体的 `Disk` 类型，而是依赖 `BlockDevice` trait；未来替换成真实磁盘驱动时，只要实现同样的 `read_block/write_block` 语义即可。
+
+`fs/block_device.rs` 暴露块设备 trait：
+
+```rust
+pub trait BlockDevice: Send + Sync + std::any::Any {
+    fn block_size(&self) -> usize;
+    fn block_count(&self) -> u64;
+    fn read_block(&self, block_id: u64, out: &mut [u8]) -> Result<(), &'static str>;
+    fn write_block(&self, block_id: u64, data: &[u8]) -> Result<(), &'static str>;
+    fn flush(&self) -> Result<(), &'static str>;
+}
+```
 
 `Disk` 对外暴露的核心接口：
 
 ```rust
 impl Disk {
-    pub fn new(label: &str, blocks: usize, block_size: usize) -> Self;
+    pub fn new(label: &str, blocks: u64, block_size: usize) -> Self;
     pub fn block_size(&self) -> usize;
-    pub fn block_count(&self) -> usize;
-    pub fn read_block(&self, block_id: usize, out: &mut [u8]) -> Result<(), &'static str>;
-    pub fn write_block(&self, block_id: usize, data: &[u8]) -> Result<(), &'static str>;
+    pub fn block_count(&self) -> u64;
+    pub fn read_block(&self, block_id: u64, out: &mut [u8]) -> Result<(), &'static str>;
+    pub fn write_block(&self, block_id: u64, data: &[u8]) -> Result<(), &'static str>;
     pub fn flush(&self) -> Result<(), &'static str>;
 }
 ```
@@ -197,7 +226,7 @@ pub struct Disk {
     pub ops: AtomicUsize,
     pub label: String,
     block_size: usize,
-    blocks: usize,
+    blocks: u64,
     storage: Mutex<Vec<u8>>,
 }
 ```
@@ -239,15 +268,15 @@ pub struct TtyHandle {
 stdin.read      -> 暂时返回 Ok(0) 表示 EOF，后续再接键盘/console input
 stdin.write     -> Err("ebadf")
 stdout.read     -> Err("ebadf")
-stdout.write    -> 写到当前模拟环境的 console sink，或者第一版只记录/丢弃并返回 buf.len()
+stdout.write    -> 写到当前用户态模拟环境的 stdout，并返回 buf.len()
 stderr.read     -> Err("ebadf")
-stderr.write    -> 同 stdout
+stderr.write    -> 写到当前用户态模拟环境的 stderr，并返回 buf.len()
 poll_status     -> stdin 按无输入处理；stdout/stderr 永远 writable
 ```
 
-如果当前用户态模拟内核暂时没有 console sink，`stdout/stderr.write` 可以先返回 `Ok(buf.len())`，但要在注释里说明这是占位行为。这样 syscall 和 fd 层可以先跑通，后面接真实串口、SBI console 或宿主输出时不用再动 `FHandle`。
+这是用户态模拟内核的占位 console sink。真实内核移植时应把这层替换成串口、SBI console 或其他 console driver，而不是改回 `FHandle`。
 
-`FLike` 需要新增：
+`FLike` 当前已经有 `Tty` 分支：
 
 ```rust
 pub enum FLike {
@@ -258,7 +287,7 @@ pub enum FLike {
 }
 ```
 
-`FLike::{read,write,poll,io_ctl,dup}` 里新增 `Tty` 分支。重点是：`TtyHandle` 和 `FHandle` 同属于 fd table 里的 file-like object，但它们不是同一种底层对象。
+`FLike::{read,write,poll,io_ctl,dup}` 里都已经分发到 `Tty`。重点是：`TtyHandle` 和 `FHandle` 同属于 fd table 里的 file-like object，但它们不是同一种底层对象。
 
 ### `fs/fd.rs`
 
@@ -301,10 +330,10 @@ read_at      -> self.fs.read_at(self.meta_index, off, buf)
 write_at     -> self.fs.write_at(self.meta_index, off, buf)
 metadata_sz  -> self.fs.metadata_len(self.meta_index)
 set_len      -> self.fs.set_len(self.meta_index, len)
-fallocate    -> self.fs.set_len(self.meta_index, offset + len)   // v1 暂时会改变可见 size
+fallocate    -> 如果 offset + len 超过当前 size，则 self.fs.set_len(...)
 ```
 
-`FHandle::new` 应该变成创建 SwapFS 句柄的构造函数，例如：
+`FHandle::new` 当前是创建 SwapFS 普通文件句柄的构造函数：
 
 ```rust
 pub fn new(path: &str, fs: Arc<SwapFs>, meta_index: usize, opt: FdOpt, cloexec: bool) -> Self;
@@ -312,59 +341,52 @@ pub fn new(path: &str, fs: Arc<SwapFs>, meta_index: usize, opt: FdOpt, cloexec: 
 
 `FHandle::with_data` 和 `data: Arc<Mutex<Vec<u8>>>` 已删除。`inode_ref()` 暂时返回 `(Arc<SwapFs>, meta_index)`，只是兼容旧名字；后续有 VFS/inode 时应改成真正 inode 引用。
 
-`FHandle` 第一阶段先只完成普通文件读写必须依赖的基础方法：
+`FHandle` 当前核心行为：
 
-| 方法 | v1 要求 |
+| 方法 | 当前行为 |
 | --- | --- |
 | `new` | 保存 `path/fs/meta_index/desc/cloexec` |
 | `dup` | 共享同一个 `desc`，所以共享 offset；但允许新的 `cloexec` |
 | `read` | 检查读权限，按 `desc.off` 调 `read_at`，成功后推进 offset |
-| `read_at` | 调 `SwapFs::read_at(meta_index, off, buf)` |
+| `read_at` | 检查读权限后调 `SwapFs::read_at(meta_index, off, buf)` |
 | `write` | 检查写权限；append 模式用文件当前 size 作为 offset；成功后推进 offset |
-| `write_at` | 调 `SwapFs::write_at(meta_index, off, buf)` |
+| `write_at` | 检查写权限后调 `SwapFs::write_at(meta_index, off, buf)` |
 | `seek` | 只修改 `desc.off`；`End` 需要读取 SwapFS metadata size |
 | `metadata_sz` | 返回 SwapFS metadata size |
 | `set_len` | 调 `SwapFs::set_len`，用于 open truncate 和后续 truncate syscall |
 
-其他方法第一版可以先 stub，但必须明确语义，不要继续访问旧的 `data` 字段：
+其他方法当前多为兼容旧接口的 stub，但已经不再访问旧的 `data` 字段：
 
-| 方法 | v1 处理 |
+| 方法 | 当前处理 |
 | --- | --- |
-| `sync_all/sync_data` | 可以先调用 `SwapFs::sync_meta` 和 `Disk::flush`，或者保守返回 `Ok(())` 并注释为 stub |
-| `lookup/read_entry` | SwapFS v1 没有目录，先返回 `Err("enosys")` 或保留只用于旧测试的 stub |
+| `sync_all/sync_data` | 返回 `Ok(())`，注释标记为 stub；当前没有 page cache/writeback 路径 |
+| `lookup` | 返回 `Ok(())` 的占位函数；目录语义后续应挪到 inode/VFS 层 |
+| `read_entry` | 返回 `entry_N` 这类合成名字，只是兼容旧接口 |
 | `poll_status` | 普通文件按 open flags 认为 ready；metadata 读失败时报告 error |
-| `io_ctl` | 普通文件返回 `Err("enotty")` 更合理；tty/device 后续自己实现 ioctl |
-| `mmap` | 返回 `Err("enosys")`，等 VM/page cache 后再做 |
+| `io_ctl` | 当前总是返回 `Ok(0)`；真实 `ioctl` 后续应由 tty/device/socket/inode 自己实现 |
+| `mmap` | 当前只校验/占位并返回 `Ok(())`；等 VM/page cache 后再做 |
 | `inode_ref` | 暂时返回 `(Arc<SwapFs>, meta_index)`；后续 VFS 化时改名或删除 |
-| `advise_readahead` | 返回 `Ok(())` 或 `Err("enosys")`，不做真实预读 |
+| `advise_readahead` | 只计算请求范围，不提交真实 I/O，返回 `Ok(())` |
 | `fallocate` | v1 暂时通过 `SwapFs::set_len` 实现，会改变可见 size |
-| `splice_to` | 可以用 `read` + `dst.write` 实现；不直接访问任何内部 backing |
+| `splice_to` | 通过 `read_at` + `dst.write` 实现；不直接访问任何内部 backing |
 
-迁移时需要逐个处理当前依赖 `data` 的方法：
+旧的 memory-backed `data` 字段已经从普通文件路径中移除。当前迁移结果：
 
-| 方法 | 当前行为 | SwapFS 后行为 |
-| --- | --- | --- |
-| `dup` | clone `data` 和 `desc` | clone `fs`、`meta_index` 和 `desc` |
-| `read` | 用 `desc.off` 调 `read_at` | 保持 offset 逻辑，底层 `read_at` 走 SwapFS |
-| `write` | append 时用 `data.len()` | append 时用 `metadata_sz()` 或 `SwapFs::metadata_len` |
-| `seek(End)` | 用 `data.len()` | 用 SwapFS metadata size |
-| `set_len` | resize `Vec<u8>` | 调 `SwapFs::set_len`，必要时扩容分配块 |
-| `metadata_sz` | 返回 `Vec<u8>.len()` | 返回 metadata 里的 `size` |
-| `poll_status` | 检查 `data` 推断 error | 按 open flags 返回 ready，metadata 读失败时报 error |
-| `sync_all/sync_data` | 空实现 | 至少调用 `SwapFs::sync_meta` 和 `Disk::flush` |
-| `fallocate` | resize `Vec<u8>` | 当前调 `SwapFs::set_len`，后续再拆成只保留 capacity 的语义 |
-| `splice_to` | 直接从 `data` 复制 | 通过 `read` + `dst.write` 做，不直接看内部字段 |
+| 方法 | 当前行为 |
+| --- | --- |
+| `dup` | clone `fs`、`meta_index` 和共享的 `desc` |
+| `read` | 用 `desc.off` 调 `read_at`，底层走 SwapFS |
+| `write` | append 时用 `metadata_len()`，底层走 SwapFS |
+| `seek(End)` | 用 SwapFS metadata size |
+| `set_len` | 调 `SwapFs::set_len`，必要时扩容分配块 |
+| `metadata_sz` | 返回 metadata 里的 `size` |
+| `poll_status` | 按 open flags 返回 ready，metadata 读失败时报 error |
+| `fallocate` | 当前调 `SwapFs::set_len`，后续再拆成只保留 capacity 的语义 |
+| `splice_to` | 通过 `read_at` + `dst.write` 做，不直接看内部字段 |
 
 `lookup`、`read_entry` 暂时不应该继续挂在普通文件 `FHandle` 上实现目录语义。SwapFS v1 没有目录，可以先保留为 stub；后续有目录时应该挪到目录文件或 VFS/inode 层。
 
-`/dev/tty` 这类对象不是 SwapFS 普通文件。当前代码暂时把它建成 `FLike::File(FHandle)`，接入 SwapFS 时需要改掉。第一版可以选择：
-
-```text
-方案 A: 新增 FLike::Tty，占位实现 stdin/stdout/stderr。
-方案 B: 暂时不在 new_user_task() 中自动创建 /dev/tty fd，相关测试需要避开它。
-```
-
-推荐方案 A，因为它能保持 fd0/fd1/fd2 的概念，同时避免把设备文件塞进 SwapFS 普通文件。
+`/dev/tty` 这类对象不是 SwapFS 普通文件。当前代码已经采用 `FLike::Tty` 表示 fd0/fd1/fd2，避免把设备文件塞进 SwapFS metadata table。
 
 ### `fs/filelike.rs`
 
@@ -463,7 +485,7 @@ dispatch_syscall -> simulator raw pointer -> Kernel fd API -> Task.files -> FLik
 - `Task::add_file` 仍然只负责分配 fd。
 - `Task::dup_fd` 需要共享 `FHandle.desc`，这样 dup 后共享 offset。
 - `cloexec` 长期应该移到 fd entry，但 v1 可以继续放在 `FHandle`。
-- `new_user_task()` 当前用 `FHandle::new("/dev/tty", ...)` 创建标准输入输出。接入 SwapFS 后不能继续这样做，因为 `FHandle::new` 会需要真实 `SwapFs + meta_index`。这里应该迁移到 `FLike::Tty` 或暂时不初始化标准 fd。
+- `new_user_task()` 当前已经用 `FLike::Tty(TtyHandle::stdin/stdout/stderr)` 初始化 fd0/fd1/fd2，不再通过 SwapFS 普通文件伪装 `/dev/tty`。
 
 ## SwapFS 内部 API
 
@@ -471,17 +493,14 @@ dispatch_syscall -> simulator raw pointer -> Kernel fd API -> Task.files -> FLik
 
 ```rust
 pub struct SwapFs {
-    disk: Arc<Disk>,
-    sb: RwLock<SwapFsSuperBlock>,
-    alloc: Mutex<SwapFsAlloc>,
-}
-
-pub struct SwapFsAlloc {
-    next_free_block: u64,
+    disk: Arc<dyn BlockDevice>,
+    sb: RwLock<SwapFsSuperBlockDisk>,
+    alloc: Mutex<()>,
+    bitmap: Bitmap,
 }
 ```
 
-`SwapFsAlloc` 不是新的磁盘真相。它只是 `superblock.next_free_block` 的运行时副本，用来减少每次分配前都读 superblock 的麻烦。每次分配 data blocks 并推进 `next_free_block` 后，必须更新内存里的 `alloc.next_free_block`，并通过 `sync_super()` 把新的 `next_free_block` 写回 block 0。否则重新 mount 后会重复分配已经用过的 block。
+`alloc: Mutex<()>` 不是分配状态。它只是在当前进程里串行化分配/释放操作，避免两个线程同时扫描并修改 bitmap。空闲块状态的真实来源在磁盘 bitmap blocks 里。
 
 SwapFS v1 不在 `mount()` 时把完整 metadata table 加载成 `Vec<SwapFsMeta>`。metadata 的真实位置是磁盘上的 metadata blocks；运行时按 `metadata index` 读写对应 record：
 
@@ -499,15 +518,17 @@ bitmap_start_block = 1
 bitmap_block_count = ceil(total_blocks / (SWAPFS_BLOCK_SIZE * 8))
 ```
 
-当前代码已经预留这个区域并把 metadata/data 起始位置后移，但 `alloc_blocks` 还没有读取 bitmap 分配。下一步新增 `bitmap.rs` 后，应让分配/释放只通过 bitmap 修改磁盘上的空闲状态。
+`Bitmap` 不把完整 bitmap 常驻内存。它保存 bitmap 区域的位置和允许分配的 data block 范围；`alloc_blocks/set_use/set_free/is_free` 执行时按需读写对应 bitmap block。
 
 方法：
 
 ```rust
 impl SwapFs {
-    pub fn format(disk: Arc<Disk>, total_blocks: u64, max_files: usize) -> Result<Arc<Self>, &'static str>;
-    pub fn mount(disk: Arc<Disk>) -> Result<Arc<Self>, &'static str>;
-    pub fn mount_or_format(disk: Arc<Disk>, total_blocks: u64, max_files: usize) -> Result<Arc<Self>, &'static str>;
+    pub fn format(disk: Arc<dyn BlockDevice>, total_blocks: u64, max_files: usize) -> Result<Arc<Self>, &'static str>;
+    pub fn mount(disk: Arc<dyn BlockDevice>) -> Result<Arc<Self>, &'static str>;
+    pub fn mount_or_format(disk: Arc<dyn BlockDevice>, total_blocks: u64, max_files: usize) -> Result<Arc<Self>, &'static str>;
+    pub fn super_block(&self) -> SwapFsSuperBlockDisk;
+    pub fn max_files(&self) -> usize;
     pub fn read_meta(&self, meta_index: usize) -> Result<SwapFsMetaDisk, &'static str>;
     pub fn write_meta(&self, meta_index: usize, meta: &SwapFsMetaDisk) -> Result<(), &'static str>;
     pub fn find_meta_by_name(&self, name: &str) -> Result<usize, &'static str>;
@@ -520,11 +541,10 @@ impl SwapFs {
     pub fn write_at(&self, meta_index: usize, off: usize, buf: &[u8]) -> Result<usize, &'static str>;
     pub fn set_len(&self, meta_index: usize, len: usize) -> Result<(), &'static str>;
     pub fn metadata_len(&self, meta_index: usize) -> Result<usize, &'static str>;
-    pub fn unlink(&self, name: &str) -> Result<(), &'static str>;
-    pub fn sync_meta(&self, meta_index: usize) -> Result<(), &'static str>;
-    pub fn sync_super(&self) -> Result<(), &'static str>;
 }
 ```
+
+当前代码还没有实现 `unlink`。metadata slot 的复用来自 `find_free_meta()` 扫描 `used == 0` 的 record；普通文件扩容搬家时，旧 data block 区间会通过 bitmap 释放。后续实现删除文件时，应该同时清 metadata record 并释放对应 data blocks。
 
 错误约定第一版可以继续使用 `&'static str`：
 
@@ -539,7 +559,7 @@ ebadf    fd 或打开权限错误
 
 ## 挂载模型
 
-这里的“挂载”第一版只表示：从一个 `Disk` 上读取 superblock，把它变成内存里的 `Arc<SwapFs>`。metadata table 不会整体读入内存，后续通过 `read_meta(index)` 按需读取。它不是完整的 Linux mount namespace，也没有多个挂载点、路径覆盖、bind mount 或 `/proc`、`/dev` 这类特殊文件系统。
+这里的“挂载”第一版只表示：从一个 `BlockDevice` 上读取 superblock，把它变成内存里的 `Arc<SwapFs>`。metadata table 不会整体读入内存，后续通过 `read_meta(index)` 按需读取。它不是完整的 Linux mount namespace，也没有多个挂载点、路径覆盖、bind mount 或 `/proc`、`/dev` 这类特殊文件系统。
 
 当前代码已有 `MountTable` / `Kernel.mnt`，但 SwapFS v1 暂时不接它。`MountTable` 现在只是路径前缀到字符串 target 的重写表，例如把 `/mnt/a` 解析成 `dev0:/a`；它还没有把 `dev0` 映射到真实 `Disk`、`SwapFs` 或 VFS 对象。为了先跑通真实文件读写，v1 的 `open/read/write` 主线不要经过 `MountTable`。
 
@@ -547,7 +567,7 @@ v1 的结构是：
 
 ```text
 Kernel
-  disk: Arc<Disk>
+  disk: Arc<Disk>              // 当前默认使用用户态内存 Disk
   swapfs: Arc<SwapFs>
 
 路径 "/a" 或 "a"
@@ -589,7 +609,7 @@ SwapFs::format(disk, total_blocks, max_files)
   清空 bitmap blocks 和 metadata table。
   设置 meta_start_block = 1 + bitmap_block_count。
   设置 data_start_block = meta_start_block + meta_block_count。
-  设置 next_free_block = data_start_block。
+  根据 superblock 创建 Bitmap 对象。
   返回新建好的 SwapFs。
 
 SwapFs::mount(disk)
@@ -597,7 +617,7 @@ SwapFs::mount(disk)
   读取 block 0。
   校验 magic/version/block_size/total_blocks/bitmap/meta/data 布局。
   不加载完整 metadata table。
-  恢复 alloc.next_free_block。
+  根据 superblock 创建 Bitmap 对象。
   返回 SwapFs。
 
 SwapFs::mount_or_format(disk, total_blocks, max_files)
@@ -621,9 +641,9 @@ metadata slot 分配：
   把新文件 metadata 写入这个 slot。
 
 data block 分配：
-  当前仍使用 superblock.next_free_block / SwapFsAlloc.next_free_block 顺序分配。
-  删除文件后暂时不回收 data blocks。
-  下一步 bitmap.rs 接入后改为扫描 block bitmap，找到连续空闲 blocks。
+  通过磁盘上的 block bitmap 分配。
+  当前 metadata 只记录 start_block + block_count，所以必须找到连续空闲 blocks。
+  alloc_blocks(0) 返回 Ok(0)，用于空文件或还没有分配数据块的文件。
 ```
 
 metadata slot 查找：
@@ -654,20 +674,18 @@ create:
   4. start_block = alloc_blocks(initial_blocks)。
   5. block_count = initial_blocks。
   6. write_meta(index, new_meta)。
-  7. alloc_blocks 内部已经 sync_super() 写回新的 next_free_block。
+  7. alloc_blocks 内部通过 bitmap.set_use() 把 data blocks 标记为已占用。
 ```
 
-删除：
+删除当前还没有实现 `unlink` API。后续实现时应做两件事：
 
 ```text
 unlink:
-  metadata.used = false
-  write_meta(index, unused_meta)
-  不回收 data blocks
-  next_free_block 不回退
+  1. metadata.used = false，写回 metadata table。
+  2. 如果 block_count > 0，通过 bitmap.set_free(start_block..start_block + block_count - 1) 释放 data blocks。
 ```
 
-这意味着当前版本中 metadata slot 可以复用，但 data blocks 暂时不会复用。磁盘布局已经预留 block bitmap 区域；后续加入 `bitmap.rs` 后，data blocks 应该可以释放并复用。
+当前版本中，文件扩容搬家成功后会释放旧 data block 区间，所以被 `bitmap.set_free()` 释放过的 data blocks 可以复用。单独把 metadata record 写成 unused 不会自动释放旧 blocks，因为当前还没有 `unlink`。metadata slot 仍然只由 `SwapFsMetaDisk.used` 表示，没有单独 metadata bitmap。
 
 ## 文件内容读写
 
@@ -703,13 +721,7 @@ block bitmap        管 data block 是否空闲
 free list/tree      管空闲区间
 ```
 
-SwapFS 当前已经预留 block bitmap 的磁盘位置，但分配器还没有切换到 bitmap。这样做是为了先跑通：
-
-```text
-create -> write -> read -> remount -> read
-```
-
-后续可以升级为：
+SwapFS 当前已经把 data block 分配切到 bitmap：
 
 ```text
 block 0        superblock
@@ -718,7 +730,7 @@ block B+1..M   metadata table
 block data...  file data
 ```
 
-第一版 bitmap 只记录 block 是否空闲，不单独引入 metadata bitmap。metadata slot 是否空闲仍由 `SwapFsMetaDisk.used` 表示。
+第一版 bitmap 只记录 data block 是否空闲，不单独引入 metadata bitmap。metadata slot 是否空闲仍由 `SwapFsMetaDisk.used` 表示。
 
 如果仍保持 `start_block + block_count` 的连续文件模型，bitmap 分配时需要找连续空闲区间；如果允许非连续 blocks，则 metadata 需要升级为 extent list 或 block list。
 
@@ -730,11 +742,12 @@ block data...  file data
 write 超过当前 block_count:
   1. 计算 required_blocks = ceil(desired_size / block_size)。
   2. 计算 grown_blocks = max(required_blocks, max(1, old_block_count * 2))。
-  3. 当前优先从 next_free_block 分配 grown_blocks，类似 Vec 扩容，减少频繁搬家。
-  4. 如果 grown_blocks 因空间不足失败，并且 grown_blocks > required_blocks，则 fallback 到 required_blocks。
-  5. 把旧文件内容复制到新位置。
-  6. 更新 metadata.start_block/block_count/size。
-  7. 当前旧空间不回收；bitmap.rs 接入后应释放旧 block 区间。
+  3. 先检查原文件后面的 blocks 是否足够空闲；如果足够，直接用 bitmap 标记为已使用并扩大 block_count。
+  4. 如果不能原地扩展，则通过 bitmap 分配一个新的连续区间。
+  5. 如果 grown_blocks 分配失败，则 fallback 到 required_blocks 再试一次。
+  6. 把旧文件的可见内容复制到新位置。
+  7. 更新 metadata.start_block/block_count；调用者随后写回 metadata.size。
+  8. 新区间分配和复制成功后，通过 bitmap 释放旧 block 区间。
 ```
 
 ## 路径规则
@@ -773,11 +786,17 @@ write 超过当前 block_count:
 chaos-tests/tests/fs_refactor/main.rs
 chaos-tests/tests/fs_refactor/disk.rs
 chaos-tests/tests/fs_refactor/tty.rs
-chaos-tests/tests/fs_refactor/swapfs.rs
-chaos-tests/tests/fs_refactor/fd.rs
+chaos-tests/tests/fs_refactor/swapfs_layout.rs
+chaos-tests/tests/fs_refactor/swapfs_format.rs
+chaos-tests/tests/fs_refactor/swapfs_metadata.rs
+chaos-tests/tests/fs_refactor/swapfs_data.rs
+chaos-tests/tests/fs_refactor/fhandle.rs
+chaos-tests/tests/fs_refactor/kernel_fd.rs
+chaos-tests/tests/fs_refactor/syscall_fd.rs
+chaos-tests/tests/fs_refactor/syscall_e2e.rs
 ```
 
-测试统一放在 `chaos-tests/tests/fs_refactor/` 下。当前已经覆盖 Disk、Tty、SwapFS layout、format/mount、metadata record 读写，以及 SwapFS metadata create/open；后续 FHandle/fd、syscall 接入测试继续在同一个 `fs-refactor` 目标下新增模块。
+测试统一放在 `chaos-tests/tests/fs_refactor/` 下。当前已经覆盖 Disk、Tty、SwapFS layout、format/mount、metadata record 读写、metadata create/open、SwapFS data read/write/set_len/growth、FHandle、Kernel fd API、syscall fd 和复杂 syscall end-to-end。
 
 最小测试：
 
@@ -793,7 +812,8 @@ chaos-tests/tests/fs_refactor/fd.rs
    - 再 open `/a` 能拿到同一个 metadata index。
    - 重复 create with exclusive 返回 `eexist`。
    - `open_or_create` 打开已有文件时不重新分配 data blocks。
-   - metadata slot 可以复用，但 data blocks 不回收，`next_free_block` 继续向前。
+   - `alloc_blocks(0)` 允许创建空文件，后续写入时再由 bitmap 分配 data blocks。
+   - 直接把 metadata slot 写成 unused 后，slot 可以复用，但旧 data blocks 不会自动释放。
    - 重新 mount 后仍能通过 metadata 找到已创建的文件。
 
 3. read/write：
@@ -816,11 +836,11 @@ chaos-tests/tests/fs_refactor/fd.rs
 6. expand：
    - 写入超过初始 block capacity。
    - 搬家后确认内容完整且 metadata 更新。
-   - 空间不足时返回 `enospc`，metadata size 和 `next_free_block` 不应被错误推进。
+   - 空间不足时返回 `enospc`，metadata size 和 bitmap 不应被错误推进。
+   - 原地扩容、搬家扩容、增长容量 fallback 到 required capacity 都有覆盖。
 
 7. unlink：
-   - unlink 后 open 返回 `enoent`。
-   - 空间不回收，`next_free_block` 不减少。
+   - 当前还没有实现；后续应测试 unlink 后 open 返回 `enoent`，并且 data blocks 被 bitmap 释放后可以复用。
 
 8. syscall/Kernel API：
    - `Kernel::open_file_for_task` 返回 fd。
@@ -853,19 +873,20 @@ chaos-tests/tests/fs_refactor/fd.rs
 
 ## 实现顺序
 
-建议按这个顺序落地：
+当前主线已经按这个顺序落地：
 
-1. 重写 `Disk::new/read_block/write_block`，让 Disk 直接作为大数组块设备读写，并更新旧的磁盘测试。
+1. 增加 `BlockDevice` trait，并让 `Disk::new/read_block/write_block` 作为内存块设备实现它。
 2. 增加 `fs/tty.rs` 和 `FLike::Tty`，把 `new_user_task()` 的 fd0/fd1/fd2 从 `FHandle("/dev/tty")` 迁移到 `TtyHandle`。
 3. 增加 `fs/swapfs/layout.rs`，实现 superblock/meta record 的 encode/decode。
-4. 增加 `SwapFs::format/mount/mount_or_format`，能读写 superblock 和 metadata table。
-5. 实现 `SwapFs::create/open/open_or_create/metadata_len`，先跑通“文件名 -> metadata index -> data block 分配”。
-6. 实现 `SwapFs::read_at/write_at/set_len`，让 metadata 指向的连续 data blocks 能读写文件内容。
-7. 改 `FHandle`，删除 `data: Arc<Mutex<Vec<u8>>>`，改成 `fs: Arc<SwapFs>` 和 `meta_index: usize`。
-8. 让 `FHandle::read_at/write_at/metadata_sz/set_len/fallocate` 直接调用 SwapFS。
-9. 改 `FLike::File`，让它只调用 `FHandle` 方法，不直接访问 `FHandle` 内部字段。
-10. 增加 `Kernel` 内部 fd API：`open_file_for_task/read_fd/write_fd/close_fd`。
-11. 改 `dispatch_syscall` 的 `SYS_OPEN/SYS_READ/SYS_WRITE/SYS_CLOSE`，通过用户态模拟 raw pointer 访问 buffer。
+4. 增加 `fs/swapfs/bitmap.rs`，用磁盘 bitmap block 记录 data block 是否空闲。
+5. 增加 `SwapFs::format/mount/mount_or_format`，能读写 superblock、清空 bitmap 和 metadata table。
+6. 实现 `SwapFs::create/open/open_or_create/metadata_len`，跑通“文件名 -> metadata index -> bitmap 分配 data blocks”。
+7. 实现 `SwapFs::read_at/write_at/set_len`，让 metadata 指向的连续 data blocks 能读写文件内容，并在扩容搬家后释放旧 block 区间。
+8. 改 `FHandle`，删除 `data: Arc<Mutex<Vec<u8>>>`，改成 `fs: Arc<SwapFs>` 和 `meta_index: usize`。
+9. 让 `FHandle::read_at/write_at/metadata_sz/set_len/fallocate` 直接调用 SwapFS。
+10. 改 `FLike::File`，让它只调用 `FHandle` 方法，不直接访问 `FHandle` 内部字段。
+11. 增加 `Kernel` 内部 fd API：`open_file_for_task/read_fd/write_fd/close_fd`。
+12. 改 `dispatch_syscall` 的 `SYS_OPEN/SYS_READ/SYS_WRITE/SYS_CLOSE`，通过用户态模拟 raw pointer 访问 buffer。
 
 ## 暂时不做
 
@@ -874,7 +895,7 @@ chaos-tests/tests/fs_refactor/fd.rs
 - dentry cache。
 - 权限、owner、mode、mtime/ctime/atime。
 - hard link/symlink。
-- block free list。
+- extent list、block list 或更复杂的 free-space tree。
 - journaling。
 - page cache 和 mmap 文件页。
 - 异步 I/O 调度。

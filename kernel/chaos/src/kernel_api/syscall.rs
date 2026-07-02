@@ -815,6 +815,7 @@ impl Kernel {
                 if signo == 0 || signo >= NSIG as usize {
                     return Err("einval");
                 }
+                // 这里好像反了
                 if signo != SIGKILL as usize && signo != SIGSTOP as usize {
                     return Err("einval");
                 }
@@ -826,6 +827,7 @@ impl Kernel {
                 }
                 let _sa_flags = if act_addr != 0 { a3 & 0xFFFF } else { 0 };
                 let _sa_mask = if act_addr != 0 { a4 } else { 0 };
+                // 后面没做事情，应该要处理一下
                 Ok(0)
             }
             SYS_SIGPROCMASK => {
@@ -846,6 +848,7 @@ impl Kernel {
                         let _stored = old_mask;
                     }
                     if set_addr != 0 {
+                        // 这里的问题：set_addr 是地址，应该在用户空间中找到这个地址对应的值再进行操作。
                         let new_set: u64 = set_addr as u64;
                         let mut mask = t.sig_mask.lock().unwrap();
                         match how {
