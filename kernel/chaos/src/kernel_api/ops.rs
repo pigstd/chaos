@@ -140,15 +140,12 @@ impl Kernel {
         let trunc = (flags & O_TRUNC) != 0;
         let cloexec = (flags & O_CLOEXEC) != 0;
 
-        let meta_index = match self.swapfs.open(path) {
-            Ok(index) => {
-                if create && excl {
-                    return Err("eexist");
-                }
-                index
-            }
-            Err("enoent") if create => self.swapfs.create(path, 1)?,
-            Err(e) => return Err(e),
+        let meta_index = if create && excl {
+            self.swapfs.create(path, 1)?
+        } else if create {
+            self.swapfs.open_or_create(path, true, 1)?
+        } else {
+            self.swapfs.open(path)?
         };
         let fh = FHandle::new(path, self.swapfs.clone(), meta_index, opt, cloexec);
         if trunc && opt.wr {

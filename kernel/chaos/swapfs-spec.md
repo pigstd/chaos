@@ -495,10 +495,23 @@ dispatch_syscall -> simulator raw pointer -> Kernel fd API -> Task.files -> FLik
 pub struct SwapFs {
     disk: Arc<dyn BlockDevice>,
     sb: RwLock<SwapFsSuperBlockDisk>,
+    op_lock: crate::sync::rwlock::RwLock,
     alloc: Mutex<()>,
     bitmap: Bitmap,
 }
 ```
+
+`op_lock` 是 SwapFS v1 的粗粒度文件系统操作锁。当前规则：
+
+```text
+read guard:
+  read_meta / find_meta_by_name / find_free_meta / open / metadata_len / read_at
+
+write guard:
+  write_meta / alloc_blocks / create / open_or_create(create=true) / write_at / set_len
+```
+
+实现上采用 public API 加锁、内部 `_locked` helper 不重复加锁的结构。原因是当前 `sync::rwlock::RwLock` 不是可重入锁；如果 `write_at()` 拿了 write lock 后又调用会拿 read lock 的 public `read_meta()`，会自旋等待自己释放锁，形成死锁。
 
 `alloc: Mutex<()>` 不是分配状态。它只是在当前进程里串行化分配/释放操作，避免两个线程同时扫描并修改 bitmap。空闲块状态的真实来源在磁盘 bitmap blocks 里。
 
@@ -887,6 +900,7 @@ chaos-tests/tests/fs_refactor/syscall_e2e.rs
 10. 改 `FLike::File`，让它只调用 `FHandle` 方法，不直接访问 `FHandle` 内部字段。
 11. 增加 `Kernel` 内部 fd API：`open_file_for_task/read_fd/write_fd/close_fd`。
 12. 改 `dispatch_syscall` 的 `SYS_OPEN/SYS_READ/SYS_WRITE/SYS_CLOSE`，通过用户态模拟 raw pointer 访问 buffer。
+13. 给 `sync::rwlock::RwLock` 增加 RAII guard，并在 `SwapFs` 上增加全局 `op_lock`，先用粗粒度锁保护 metadata/bitmap/data 的多步操作。
 
 ## 暂时不做
 
@@ -896,7 +910,9 @@ chaos-tests/tests/fs_refactor/syscall_e2e.rs
 - 权限、owner、mode、mtime/ctime/atime。
 - hard link/symlink。
 - extent list、block list 或更复杂的 free-space tree。
+- per-file、per-metadata-block、per-bitmap-block 这类细粒度并发锁。
 - journaling。
+- 崩溃恢复和跨内核实例共享同一块磁盘。
 - page cache 和 mmap 文件页。
 - 异步 I/O 调度。
 

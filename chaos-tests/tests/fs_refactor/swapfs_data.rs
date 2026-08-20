@@ -1,5 +1,6 @@
 use chaos_tests::*;
 use std::sync::Arc;
+use std::thread;
 
 #[test]
 fn swapfs_write_then_read_round_trips_file_bytes() {
@@ -117,6 +118,44 @@ fn swapfs_written_data_survives_remount() {
     assert_eq!(remounted.read_at(reopened, 0, &mut out), Ok(14));
     assert!(out[..7].iter().all(|&b| b == 0));
     assert_eq!(&out[7..], b"persist");
+}
+
+#[test]
+fn swapfs_concurrent_writes_are_serialized_by_fs_lock() {
+    let disk = Arc::new(Disk::new("swap0", 128, SWAPFS_BLOCK_SIZE));
+    let fs = SwapFs::format(disk, 128, 4).unwrap();
+    let index = fs.create("shared", 0).unwrap();
+
+    let mut expected = Vec::new();
+    let mut writers = Vec::new();
+    for i in 0..6 {
+        let offset = i * SWAPFS_BLOCK_SIZE * 2;
+        let len = SWAPFS_BLOCK_SIZE + i * 17 + 1;
+        let byte = b'a' + i as u8;
+        let fs = fs.clone();
+        writers.push(thread::spawn(move || {
+            let data = vec![byte; len];
+            assert_eq!(fs.write_at(index, offset, &data), Ok(len));
+        }));
+        expected.push((offset, len, byte));
+    }
+
+    for writer in writers {
+        writer.join().unwrap();
+    }
+
+    let expected_len = expected
+        .iter()
+        .map(|(offset, len, _)| offset + len)
+        .max()
+        .unwrap();
+    assert_eq!(fs.metadata_len(index), Ok(expected_len));
+
+    let mut out = vec![0xAAu8; expected_len];
+    assert_eq!(fs.read_at(index, 0, &mut out), Ok(expected_len));
+    for (offset, len, byte) in expected {
+        assert!(out[offset..offset + len].iter().all(|&b| b == byte));
+    }
 }
 
 #[test]

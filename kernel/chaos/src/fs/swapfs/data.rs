@@ -3,7 +3,12 @@ use crate::*;
 
 impl SwapFs {
     pub fn metadata_len(&self, meta_index: usize) -> Result<usize, &'static str> {
-        let meta = self.read_meta(meta_index)?;
+        let _guard = self.op_lock.read_guard();
+        self.metadata_len_locked(meta_index)
+    }
+
+    pub(crate) fn metadata_len_locked(&self, meta_index: usize) -> Result<usize, &'static str> {
+        let meta = self.read_meta_locked(meta_index)?;
         self.validate_file_meta(&meta)?;
         meta_size_usize(&meta)
     }
@@ -14,7 +19,17 @@ impl SwapFs {
         off: usize,
         buf: &mut [u8],
     ) -> Result<usize, &'static str> {
-        let meta = self.read_meta(meta_index)?;
+        let _guard = self.op_lock.read_guard();
+        self.read_at_locked(meta_index, off, buf)
+    }
+
+    pub(crate) fn read_at_locked(
+        &self,
+        meta_index: usize,
+        off: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, &'static str> {
+        let meta = self.read_meta_locked(meta_index)?;
         self.validate_file_meta(&meta)?;
         let size = meta_size_usize(&meta)?;
         if off >= size || buf.is_empty() {
@@ -31,7 +46,17 @@ impl SwapFs {
         off: usize,
         buf: &[u8],
     ) -> Result<usize, &'static str> {
-        let mut meta = self.read_meta(meta_index)?;
+        let _guard = self.op_lock.write_guard();
+        self.write_at_locked(meta_index, off, buf)
+    }
+
+    pub(crate) fn write_at_locked(
+        &self,
+        meta_index: usize,
+        off: usize,
+        buf: &[u8],
+    ) -> Result<usize, &'static str> {
+        let mut meta = self.read_meta_locked(meta_index)?;
         self.validate_file_meta(&meta)?;
         if buf.is_empty() {
             return Ok(0);
@@ -46,13 +71,18 @@ impl SwapFs {
         self.write_to_blocks(meta.start_block, meta.block_count, off, buf)?;
         if end > old_size {
             meta.size = end as u64;
-            self.write_meta(meta_index, &meta)?;
+            self.write_meta_locked(meta_index, &meta)?;
         }
         Ok(buf.len())
     }
 
     pub fn set_len(&self, meta_index: usize, len: usize) -> Result<(), &'static str> {
-        let mut meta = self.read_meta(meta_index)?;
+        let _guard = self.op_lock.write_guard();
+        self.set_len_locked(meta_index, len)
+    }
+
+    pub(crate) fn set_len_locked(&self, meta_index: usize, len: usize) -> Result<(), &'static str> {
+        let mut meta = self.read_meta_locked(meta_index)?;
         self.validate_file_meta(&meta)?;
         let old_size = meta_size_usize(&meta)?;
         if len == old_size {
@@ -64,7 +94,7 @@ impl SwapFs {
             self.zero_range(&meta, old_size, len - old_size)?;
         }
         meta.size = len as u64;
-        self.write_meta(meta_index, &meta)
+        self.write_meta_locked(meta_index, &meta)
     }
 
     fn validate_file_meta(&self, meta: &SwapFsMetaDisk) -> Result<(), &'static str> {

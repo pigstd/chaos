@@ -4,6 +4,7 @@ use crate::*;
 pub struct SwapFs {
     pub(crate) disk: Arc<dyn BlockDevice>,
     pub(crate) sb: RwLock<SwapFsSuperBlockDisk>,
+    pub(crate) op_lock: crate::sync::rwlock::RwLock,
     pub(crate) alloc: Mutex<()>,
     pub(crate) bitmap: Bitmap,
 }
@@ -47,6 +48,7 @@ impl SwapFs {
         Ok(Arc::new(Self {
             disk,
             sb: RwLock::new(sb),
+            op_lock: crate::sync::rwlock::RwLock::new(),
             alloc: Mutex::new(()),
             bitmap,
         }))
@@ -67,6 +69,7 @@ impl SwapFs {
         Ok(Arc::new(Self {
             disk,
             sb: RwLock::new(sb),
+            op_lock: crate::sync::rwlock::RwLock::new(),
             alloc: Mutex::new(()),
             bitmap,
         }))
@@ -92,6 +95,11 @@ impl SwapFs {
     }
 
     pub fn alloc_blocks(&self, block_count: u64) -> Result<u64, &'static str> {
+        let _guard = self.op_lock.write_guard();
+        self.alloc_blocks_locked(block_count)
+    }
+
+    pub(crate) fn alloc_blocks_locked(&self, block_count: u64) -> Result<u64, &'static str> {
         if block_count == 0 {
             return Ok(0);
         }

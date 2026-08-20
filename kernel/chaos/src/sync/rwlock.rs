@@ -13,9 +13,25 @@ pub struct RwLock {
     // status = n: read lock held by n readers
 }
 
+pub struct RwReadGuard<'a> {
+    lock: &'a RwLock,
+}
+
+pub struct RwWriteGuard<'a> {
+    lock: &'a RwLock,
+}
+
 impl RwLock {
     pub fn new() -> Self {
         RwLock { status: AtomicUsize::new(0) }
+    }
+    pub fn read_guard(&self) -> RwReadGuard<'_> {
+        self.read_lock();
+        RwReadGuard { lock: self }
+    }
+    pub fn write_guard(&self) -> RwWriteGuard<'_> {
+        self.write_lock();
+        RwWriteGuard { lock: self }
     }
     pub fn read_lock(&self) {
         loop {
@@ -50,5 +66,17 @@ impl RwLock {
     }
     pub fn write_unlock(&self) {
         self.status.store(0, Ordering::Release);
+    }
+}
+
+impl Drop for RwReadGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.read_unlock();
+    }
+}
+
+impl Drop for RwWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.write_unlock();
     }
 }
